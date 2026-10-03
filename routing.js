@@ -6,11 +6,19 @@
 //riverbed, or natural ground below sea level, has water above it. Land vehicles can't cross water unless something is
 //built on top (a bridge deck shows instead of the riverbed); boats only move on water. Tunnels can't be seen from above.
 //
+//Off road, a cart or truck mostly can't get through: trees (not on the map, but forest soil means them) and natural
+//steps of two or more blocks between neighbouring columns stop it. Those cells are made very slow rather than closed, so
+//a route still exists when nothing better does but is ranked accordingly; steps of three or more (cliffs, ravine walls)
+//are closed. Roads and constructed ground are exempt: someone made them drivable.
+//
 //The world is reduced to cells of CELL x CELL blocks and searched with Dijkstra in a worker (window.Routing below).
 "use strict";
 (function () {
   const CELL = 4;
-  const OFFROAD_FOREST = 0.6;     // forest soils: trees aren't on the map but block vehicles
+  const OFFROAD_FOREST = 0.15;    // forest soils without a road: trees aren't on the map but block vehicles
+  const OFFROAD_STEEP = 0.15;     // off road with a natural step of STEEP_STEP blocks between neighbouring columns
+  const STEEP_STEP = 2;
+  const CLIFF_STEP = 3;           // off road with a step this high: impassable for land vehicles
   const SLOPE_COST = 2;           // extra time per block climbed per block driven
   const ROUGH_COST = 3;           // off road: slowdown per block of average step inside a cell
   const FREE_RADIUS = 3;          // cells around a shop where walls/steps don't block (getting out of the building)
@@ -44,9 +52,10 @@
         else {
           let v = (1 + (G.surf[c] - 1) * p.roadMult) * p.offroad / (1 + G.ROUGH_COST * G.rough[c]);
           if (G.forest[c]) v *= G.OFFROAD_FOREST;
+          if (G.maxStep[c] >= G.STEEP_STEP) v *= G.OFFROAD_STEEP;
           e[c] = v;
         }
-        if (e[c] < 0.03) e[c] = 0.03;
+        if (e[c] < 0.01) e[c] = 0.01;
       }
       effs.set(key, e);
       return e;
@@ -67,7 +76,7 @@
       }
       return out;
     }
-    const okFor = p => p.mode === "water" ? c => G.water[c] === 1 : c => G.blocked[c] === 0;
+    const okFor = p => p.mode === "water" ? c => G.water[c] === 1 : c => G.blocked[c] === 0 && G.cliff[c] === 0;
 
     //Binary heap of (key, node) with lazy deletion.
     function heap() {
@@ -207,14 +216,33 @@
     const natural = new Map(Object.entries(colors.natural).map(([k, v]) => [hexInt(k), v]));
     const riverbed = new Set(colors.riverbed.map(hexInt)), forestSet = new Set(colors.forest.map(hexInt));
     const n = N * N;
-    const g = { N, CELL, SLOPE_COST, ROUGH_COST, OFFROAD_FOREST, FREE_RADIUS,
+    const g = { N, CELL, SLOPE_COST, ROUGH_COST, OFFROAD_FOREST, OFFROAD_STEEP, STEEP_STEP, FREE_RADIUS,
       h: new Float32Array(n), road: new Float32Array(n), surf: new Float32Array(n), rough: new Float32Array(n),
-      forest: new Uint8Array(n), paved: new Uint8Array(n), blocked: new Uint8Array(n), water: new Uint8Array(n) };
+      forest: new Uint8Array(n), paved: new Uint8Array(n), blocked: new Uint8Array(n), water: new Uint8Array(n),
+      maxStep: new Uint8Array(n), cliff: new Uint8Array(n) };
+    //Per pixel: the largest height step to a neighbouring column, where both are natural dry ground (a step onto a
+    //road, a wall or into water says nothing about how rough the land is).
+    const nat = new Uint8Array(size * size), pxStep = new Uint8Array(size * size);
+    for (let px = 0; px < size * size; px++) {
+      const i = px * 4, nEff = natural.get((tp[i] << 16) | (tp[i + 1] << 8) | tp[i + 2]);
+      nat[px] = nEff !== undefined && hp[i] >= seaLevel ? 1 : 0;
+    }
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const px = y * size + x;
+      if (!nat[px]) continue;
+      for (const q of [x + 1 < size ? px + 1 : -1, y + 1 < size ? px + size : -1]) {
+        if (q < 0 || !nat[q]) continue;
+        const d = Math.abs(hp[px * 4] - hp[q * 4]);
+        if (d > pxStep[px]) pxStep[px] = d;
+        if (d > pxStep[q]) pxStep[q] = d;
+      }
+    }
     const hs = new Float32Array(CELL * CELL);
     for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-      let roadEff = 0, surf = 0, land = 0, waterPx = 0, deck = 0, constructed = 0, forest = 0, step = 0, k = 0;
+      let roadEff = 0, surf = 0, land = 0, waterPx = 0, deck = 0, constructed = 0, forest = 0, step = 0, maxStep = 0, k = 0;
       for (let y = 0; y < CELL; y++) for (let x = 0; x < CELL; x++) {
         const px = (r * CELL + y) * size + (c * CELL + x), i = px * 4;
+        if (pxStep[px] > maxStep) maxStep = pxStep[px];
         const rgb = (tp[i] << 16) | (tp[i + 1] << 8) | tp[i + 2], ht = hp[i];
         hs[k++] = ht;
         if (x > 0) step += Math.abs(ht - hp[i - 4]);
@@ -236,6 +264,8 @@
       g.paved[cell] = constructed * 2 >= CELL * CELL ? 1 : 0;
       g.water[cell] = waterPx * 2 >= CELL * CELL ? 1 : 0;
       g.blocked[cell] = waterPx > 0 && deck === 0 ? 1 : 0;
+      g.maxStep[cell] = maxStep;
+      g.cliff[cell] = maxStep >= CLIFF_STEP && roadEff === 0 && !g.paved[cell] ? 1 : 0;
     }
     return g;
   }

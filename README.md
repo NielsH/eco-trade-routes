@@ -45,12 +45,13 @@ Travel times are routed over the real map (`routing.js`, in a background worker;
 - **Roads** are read from the map colours (dirt road 1.0, stone road 1.1, asphalt 1.2: Eco's `Road` efficiency). A
   vehicle's speed on a surface is `1 + (efficiency − 1) × road multiplier`, as in Eco's client (Powered Cart 1.5,
   Truck 4: trucks gain most from roads).
-- **Off road** is slower: the off-road speed setting (default 0.5), more so on bumpy ground (from the height map) and in
-  forest biomes (trees aren't on the map but block vehicles).
+- **Off road** is slower: the off-road speed setting (default 0.5), more so on bumpy ground (from the height map).
+  Forest without a road (trees aren't on the map but block vehicles) and ground with natural 2-block steps are about 7×
+  slower again, so a run only crosses them when there's no real alternative.
 - **Water** is impassable for land vehicles unless something is built on it (a bridge). Boats only move on water and
   can reach a shop within about 12 blocks of it. The map doesn't draw water, so it's inferred: riverbed, or natural
   ground below sea level.
-- **Cliffs and walls** (more than one block up per block) can't be driven.
+- **Cliffs and walls** (natural steps of 3+ blocks off road, or more than one block up per block) can't be driven.
 - **Not visible from above**: tunnels, and anything under a roof. Shops that can't be reached are left out of runs.
 
 The map shows each leg along its route with its share on roads. Switch "Travel time" to "straight line × road factor"
