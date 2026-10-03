@@ -10,6 +10,7 @@ It reads the server live:
 | `/api/v1/plugins/RecipeApi/shops` | every shop: position, status, currency, owner balance, offers, and how much each buy offer can take right now |
 | `/api/v1/plugins/RecipeApi/items` | weight, stack size, carried flag and tags of every item |
 | `/api/v1/plugins/RecipeApi/players` | online players' positions, to plan from where you stand |
+| `/api/v1/plugins/RecipeApi/vehicles` | placed vehicles with their real cargo storage: slots, weight, exactly which items fit and how many per slot, fitted modules |
 | `/api/v1/plugins/RecipeApi/tags` | fallback for tag offers on servers whose `/items` has no `Tags` yet |
 | `/Layers/TerrainLatest.gif` | the server's own 2D map, used as the backdrop |
 
@@ -28,7 +29,11 @@ point it elsewhere with `?server=https://your.server`.
   space. Spare room on a leg is filled with goods for a later stop (side deals).
 - **Continue from <last stop>** plans the next run from where this one ends, assuming its trades happened.
   **Refresh** reloads the real state.
-- **Settings**: vehicle (slots, max kg and speed are editable), cash limit, legs, currency, time per stop, road
+- **Vehicle**: your own placed vehicles (when you picked your player), every vehicle type placed on the server, and a
+  built-in table (`vehicles.js`) for types nobody has placed. Only hauling vehicles are offered: digging and farming
+  vehicles (excavator, skid steer, tractors) load into a tool bucket, not cargo. A vehicle's own item rules apply, e.g.
+  the Scorpion only takes logs, 100 per slot.
+- **Settings**: vehicle slots, max kg and speed (editable), cash limit, legs, currency, time per stop, road
   factor (road distance / straight line) and a sale bonus %. Turn on edge wrap for boats only: on a world ringed by
   ocean, land vehicles can't cross the edge.
 

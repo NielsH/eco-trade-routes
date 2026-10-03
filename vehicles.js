@@ -1,29 +1,11 @@
 //Vehicle cargo capacity and speed, from Eco's AutoGen vehicle sources. Regenerate with: python tools/build_catalog.py
 //Modular vehicles (trucks, tractors) get storage from fitted modules: slots/maxWeightKg are null, set them in the page.
 window.VEHICLES = {
- "Crane": {
-  "slots": null,
-  "maxWeightKg": null,
-  "speed": 30.0,
-  "water": false
- },
  "EgyptianCanoe": {
   "slots": 3,
   "maxWeightKg": 400.0,
   "speed": 10.0,
   "water": true
- },
- "Excavator": {
-  "slots": null,
-  "maxWeightKg": null,
-  "speed": 14.0,
-  "water": false
- },
- "HandPlow": {
-  "slots": null,
-  "maxWeightKg": null,
-  "speed": 10.0,
-  "water": false
  },
  "IndustrialBarge": {
   "slots": 96,
@@ -65,13 +47,16 @@ window.VEHICLES = {
   "slots": 7,
   "maxWeightKg": 7000.0,
   "speed": 14.0,
-  "water": false
- },
- "SkidSteer": {
-  "slots": null,
-  "maxWeightKg": null,
-  "speed": 16.0,
-  "water": false
+  "water": false,
+  "storages": [
+   {
+    "Accepts": {
+     "OnlyTags": [
+      "Wood"
+     ]
+    }
+   }
+  ]
  },
  "SmallCanoe": {
   "slots": 3,
@@ -90,12 +75,6 @@ window.VEHICLES = {
   "maxWeightKg": 3500.0,
   "speed": 12.0,
   "water": true
- },
- "SteamTractor": {
-  "slots": null,
-  "maxWeightKg": null,
-  "speed": 12.0,
-  "water": false
  },
  "SteamTruck": {
   "slots": null,

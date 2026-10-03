@@ -113,13 +113,17 @@ def main():
         if not v:
             continue
         s = STORAGE_RE.search(src)
+        # Not transport: a digging/farming tool bucket (excavator, skid steer, steam tractor) isn't cargo, and a vehicle with
+        # neither cargo storage nor modules (crane, hand plow) carries nothing.
+        if "VehicleToolComponent" in src or (not s and "ModularVehicleComponent" not in src):
+            continue
         name = os.path.basename(p)[:-3]
         vehicles[name] = {
             "slots": int(s.group(1)) if s else None,
             "maxWeightKg": int(s.group(2)) / 1000 if s else None,
             "restriction": (s.group(3) or "").strip() or None if s else None,
             "speed": float(v.group(1)),
-            "water": bool(v.group(4)),
+            "water": "BoatComponent" in src,  # the 5th VehicleComponent.Initialize arg is isDrivenUnderwater, not "is a boat"
             "modular": "ModularVehicleComponent" in src,
             "note": "storage comes from fitted modules: fill in slots/maxWeightKg by hand" if "ModularVehicleComponent" in src and not s else None,
         }
@@ -137,7 +141,13 @@ def main():
     json.dump(vehicles, open(vpath, "w"), indent=1)
     # The web page reads the same table from vehicles.js at the repo root.
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-    slim = {k: {f: v.get(f) for f in ("slots", "maxWeightKg", "speed", "water")} for k, v in sorted(vehicles.items())}
+    def slim_entry(v):
+        out = {f: v.get(f) for f in ("slots", "maxWeightKg", "speed", "water")}
+        tags = re.findall(r'TagRestriction\(\s*"([^"]+)"', v.get("restriction") or "")
+        if tags:  # same shape the page gets from /vehicles, by tag because the static table has no item list
+            out["storages"] = [{"Accepts": {"OnlyTags": tags}}]
+        return out
+    slim = {k: slim_entry(v) for k, v in sorted(vehicles.items())}
     open(os.path.join(root, "vehicles.js"), "w", encoding="utf-8", newline="\n").write(
         "//Vehicle cargo capacity and speed, from Eco's AutoGen vehicle sources. Regenerate with: python tools/build_catalog.py\n"
         "//Modular vehicles (trucks, tractors) get storage from fitted modules: slots/maxWeightKg are null, set them in the page.\n"

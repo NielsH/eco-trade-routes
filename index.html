@@ -117,6 +117,7 @@ table.offers { width: 100%; border-collapse: collapse; font-size: 12px; margin-t
           <label>Bonus %<input id="bonus" type="number" min="0" step="1"></label>
           <label>Wrap edges<select id="wrap"><option value="0">no (land)</option><option value="1">yes (boats)</option></select></label>
         </div>
+        <div class="sub" id="cargoNote" style="margin-top:4px"></div>
       </details>
     </div>
     <div class="tabs" role="tablist">
@@ -155,6 +156,7 @@ const store = { get(k, d) { try { const v = localStorage.getItem("trade." + k); 
 
 // ---------------- state ----------------
 let SHOPS = [], BYID = {}, ITEMS = {}, PLAYERS = [], RUNS = [], DEALS = [], M = null;
+let LIVE_VEHICLES = null;   // /vehicles: placed vehicles with real cargo storage; null on servers without the route
 let start = store.get("start", null);   // null | {kind:"pos", x, z, label} | {kind:"shop", id} | {kind:"player", name}
 let tab = "runs", selected = null, hoverShop = null, picking = false, loadedAt = null;
 let DONE = { sold: {}, bought: {}, money: {} }, doneRuns = 0;   // trades of runs you continued from; cleared by Refresh
@@ -172,9 +174,10 @@ async function load() {
   $("status").textContent = "Loading shops, items and players…";
   DONE = { sold: {}, bought: {}, money: {} }; doneRuns = 0;
   try {
-    const [shops, items, players] = await Promise.all([
+    const [shops, items, players, vehicles] = await Promise.all([
       getJSON(API + "/shops"), getJSON(API + "/items"),
       getJSON(API + "/players").catch(() => ({ Players: null })),   // older RecipeApi without /players
+      getJSON(API + "/vehicles").catch(() => ({ Vehicles: null })), // older RecipeApi without /vehicles
     ]);
     ITEMS = {};
     for (const i of items.Items) ITEMS[i.Item] = { weightKg: i.Weight / 1000, stackSize: i.MaxStackSize, carried: i.Carried, name: i.Name, tags: i.Tags };
@@ -186,7 +189,11 @@ async function load() {
       const byName = Object.fromEntries(items.Items.map(i => [i.Name, i.Item]));
       let tags = null;
       for (const u of ["/tags?all=true", "/tags"]) { try { tags = (await getJSON(API + u)).Tags; break; } catch (e) {} }
-      for (const [t, names] of Object.entries(tags || {})) tagIndex[norm(t)] = names.map(n => byName[n]).filter(Boolean);
+      if (tags) for (const it of Object.values(ITEMS)) it.tags = [];   // tag data loaded: an item in no list has no (listed) tags
+      for (const [t, names] of Object.entries(tags || {})) {
+        tagIndex[norm(t)] = names.map(n => byName[n]).filter(Boolean);
+        for (const type of tagIndex[norm(t)]) (ITEMS[type].tags ||= []).push(t);   // items get their tags from the same data
+      }
     }
     SHOPS = shops.Shops.filter(s => !s.Error).map(s => ({
       id: s.Id, name: clean(s.Name), owner: s.Owner, x: s.Position.X, z: s.Position.Z, position: { x: s.Position.X, z: s.Position.Z },
@@ -200,8 +207,9 @@ async function load() {
     }));
     BYID = Object.fromEntries(SHOPS.map(s => [s.id, s]));
     PLAYERS = players.Players;
+    LIVE_VEHICLES = vehicles.Vehicles && vehicles.Vehicles.filter(v => !v.Error);
     loadedAt = shops.GeneratedAt;
-    fillCurrencies(); fillPlayers();
+    fillCurrencies(); fillPlayers(); fillVehicles();
     replan();
   } catch (e) {
     $("status").innerHTML = `<span class="err">Could not load from ${esc(SERVER)}: ${esc(e.message)}</span>`;
@@ -217,6 +225,21 @@ function dist(a, b) {
 }
 const minutes = (a, b) => dist(a, b) * S.routeFactor / S.speed / 60;
 const itemInfo = name => ITEMS[name] || { weightKg: 0, stackSize: 100, carried: false, unknown: true };
+// Cargo rules come from /vehicles: per storage, which items it takes (Accepts: null = all, {Only}, {Except}) and how many
+// per slot (StackSizes: null = the item's own, {All: n}, {Items: {type: n}}). The static table has no storages: all items fit.
+function storageTakes(st, name) {
+  const a = st.Accepts;
+  if (!a) return true;
+  if (a.OnlyTags) { const tags = itemInfo(name).tags; return !tags || tags.some(t => a.OnlyTags.some(o => norm(o) === norm(t))); }   // static table entries; unknown tags: allow
+  st._only ||= a.Only && new Set(a.Only); st._except ||= a.Except && new Set(a.Except);
+  return a.Only ? st._only.has(name) : !st._except.has(name);
+}
+const takerOf = name => CARGO.storages.find(st => storageTakes(st, name));
+const fits = name => !CARGO.storages.length || !!takerOf(name);
+function stackOf(name) {
+  const it = itemInfo(name), ss = CARGO.storages.length ? takerOf(name)?.StackSizes : null;
+  return ss?.All ?? ss?.Items?.[name] ?? it.stackSize;
+}
 const mod = (a, n) => ((a % n) + n) % n;
 
 function buildMarket() {
@@ -232,7 +255,7 @@ function buildMarket() {
       if (bo.quantity <= 0) continue;
       for (const name of bo.item ? [bo.item] : (bo.tagItems || [])) {   // a tag offer takes any item in its tag, sharing one limit
         const so = sells[X.id][name];
-        if (!so) continue;
+        if (!so || !fits(name)) continue;
         const unit = bo.price * (1 + S.bonus) - so.price;
         if (unit > 0) m.push({ name, so, bo, unit });
       }
@@ -244,7 +267,7 @@ function buildMarket() {
 
 function fill(X, Y, st, slotsLeft, weightLeft, cash) {
   const cands = [...(M.pairs.get(X + "|" + Y) || [])];
-  const dens = c => { const it = itemInfo(c.name); return c.unit / Math.max(1 / it.stackSize / S.slots, it.weightKg / S.maxWeightKg); };
+  const dens = c => { const it = itemInfo(c.name); return c.unit / Math.max(1 / stackOf(c.name) / S.slots, it.weightKg / S.maxWeightKg); };
   cands.sort((a, b) => dens(b) - dens(a));
   const Ys = M.byId[Y];
   const yMoney = Ys.balance === "infinite" ? Infinity : (Ys.balance || 0) - (st.money[Y] || 0);
@@ -257,15 +280,16 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
     if (bo.quantity === 999 && !bo.limit) want = Infinity;
     let q = Math.min(avail, want);
     if (q <= 0) continue;
-    const roomSlots = (slotsLeft - usedSlots) * it.stackSize + (partial[name] || 0);
+    const stack = stackOf(name);
+    const roomSlots = (slotsLeft - usedSlots) * stack + (partial[name] || 0);
     const roomW = it.weightKg > 0 ? Math.floor((weightLeft - usedW) / it.weightKg) : Infinity;
     const afford = so.price > 0 ? Math.floor((cash - cost) / so.price) : Infinity;
     const payable = bo.price > 0 ? Math.floor((yMoney - revenue) / bo.price) : Infinity;
     q = Math.floor(Math.min(q, roomSlots, roomW, afford, payable));
     if (!(q > 0)) continue;
     const newTotal = q - (partial[name] || 0);
-    usedSlots += Math.max(0, Math.ceil(newTotal / it.stackSize));
-    partial[name] = mod(-newTotal, it.stackSize);
+    usedSlots += Math.max(0, Math.ceil(newTotal / stack));
+    partial[name] = mod(-newTotal, stack);
     usedW += q * it.weightKg; cost += q * so.price; revenue += q * bo.price * (1 + S.bonus);
     taken[bo.key] = (taken[bo.key] || 0) + q;
     load.push({ item: name, qty: q, buy: so.price, sell: bo.price, profit: q * unit, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown });
@@ -342,7 +366,7 @@ function directDeals(startPos) {
     const lead = startPos ? minutes(startPos, A.position) : 0, leg = minutes(A.position, B.position) + S.stopMinutes;
     for (const { name, so, bo, unit } of cands) {
       const it = itemInfo(name);
-      const cap = Math.min(S.slots * it.stackSize, it.weightKg > 0 ? Math.floor(S.maxWeightKg / it.weightKg) : Infinity);
+      const cap = Math.min(S.slots * stackOf(name), it.weightKg > 0 ? Math.floor(S.maxWeightKg / it.weightKg) : Infinity);
       const limits = { "A stock": so.quantity - (DONE.sold[X + "|" + name] || 0),
         "B wants": bo.quantity === 999 && !bo.limit ? Infinity : bo.quantity - (DONE.bought[bo.key] || 0),
         "B money": B.balance === "infinite" ? Infinity : Math.floor(((B.balance || 0) - (DONE.money[Y] || 0)) / bo.price),
@@ -386,20 +410,89 @@ function doReplan() {
 }
 
 // ---------------- settings ----------------
-const FIELDS = { vehicle: "PoweredCart", slots: "", maxkg: "", speed: "", cash: "", legs: 4, minLegs: 1, currency: "", stopMin: 1, routeFactor: 1.3, bonus: 0, wrap: "0" };
+// Cargo rules of the chosen vehicle; slots/max kg/speed live in the form so they stay editable.
+let CARGO = { storages: [] };
+const FIELDS = { vehicle: "s:PoweredCart", slots: "", maxkg: "", speed: "", cash: "", legs: 4, minLegs: 1, currency: "", stopMin: 1, routeFactor: 1.3, bonus: 0, wrap: "0" };
 function initForm() {
-  $("vehicle").innerHTML = Object.entries(VEHICLES).map(([k, v]) => `<option value="${k}">${pretty(k)}${v.water ? " (water)" : ""}${v.slots ? "" : " (set slots)"}</option>`).join("");
-  for (const [id, d] of Object.entries(FIELDS)) $(id).value = store.get("f." + id, d);
-  if (!$("vehicle").value) $("vehicle").value = "PoweredCart";
+  fillVehicles();
+  for (const [id, d] of Object.entries(FIELDS)) if (id !== "vehicle") $(id).value = store.get("f." + id, d);
   if (!$("slots").value) vehicleDefaults();
   $("vehicle").addEventListener("change", () => { vehicleDefaults(); saveForm(); replan(); });
+  applyCargo();
   for (const id of Object.keys(FIELDS)) if (id !== "vehicle") $(id).addEventListener("change", () => { saveForm(); replan(); });
 }
+// A placed vehicle's cargo. General storages (taking all or most items) count towards slots and weight; storages limited
+// to a few items (a log-only bay) only when the vehicle has nothing else. Tool buckets (skid steer, excavator, tractor)
+// aren't cargo and never appear in Storage, so those vehicles get no cargo at all.
+function cargoOf(v) {
+  const all = (v.Storage || []).filter(s => s.Slots > 0), general = all.filter(s => !s.Accepts?.Only), use = general.length ? general : all;
+  if (!use.length) return null;
+  return {
+    slots: use.reduce((n, s) => n + s.Slots, 0),
+    maxWeightKg: use.every(s => s.MaxWeight != null) ? use.reduce((n, s) => n + s.MaxWeight, 0) / 1000 : 1e9,
+    speed: v.Speed, water: v.Water, storages: use, modules: v.Modules || [],
+  };
+}
+// Short human summary of what a cargo takes, for the dropdown and the note.
+function cargoLimits(c) {
+  const out = [];
+  for (const st of c.storages || []) {
+    const a = st.Accepts, ss = st.StackSizes;
+    if (a?.OnlyTags) out.push("only " + a.OnlyTags.join(", "));
+    if (a?.Only) out.push("only " + (a.Only.length <= 3 ? a.Only.map(pretty).join(", ") : `${a.Only.length} item types (${a.Only.slice(0, 3).map(pretty).join(", ")}…)`));
+    if (a?.Except && a.Except.length <= 4) out.push("not " + a.Except.map(pretty).join(", "));
+    else if (a?.Except) out.push(`${a.Except.length} item types refused`);
+    if (ss?.All) out.push(`${ss.All} per slot`);
+    else if (ss?.Items) out.push("custom stack sizes");
+  }
+  return [...new Set(out)];
+}
+const staticKey = type => type.replace(/Object$/, "");
+function vehicleSpec(value) {
+  const [kind, key] = [value.slice(0, 1), value.slice(2)];
+  if (kind === "v" || kind === "t") {
+    const v = kind === "v" ? (LIVE_VEHICLES || []).find(x => x.Id === key) : bestOfType(key);
+    if (v) return cargoOf(v);
+  }
+  const st = VEHICLES[kind === "s" ? key : staticKey(key)] || VEHICLES[value];   // last: values saved by older versions ("PoweredCart")
+  return st && { slots: st.slots, maxWeightKg: st.maxWeightKg, speed: st.speed, water: st.water, storages: st.storages || [], modules: [] };
+}
+// The placed vehicle of a type with the most cargo (modular vehicles differ by fitted modules).
+const bestOfType = type => (LIVE_VEHICLES || []).filter(v => v.Type === type && cargoOf(v)).sort((a, b) => cargoOf(b).slots - cargoOf(a).slots)[0];
+function fillVehicles() {
+  const sel = $("vehicle"), keep = sel.value || store.get("f.vehicle", FIELDS.vehicle);
+  const me = start?.kind === "player" ? start.name : store.get("me", "");
+  const opt = (value, text) => `<option value="${esc(value)}">${esc(text)}</option>`;
+  const desc = c => [`${c.slots} slots, ${fmt(c.maxWeightKg, 0)} kg`, ...cargoLimits(c), ...(c.water ? ["boat"] : [])].join(", ");
+  let html = "";
+  const live = (LIVE_VEHICLES || []).filter(v => cargoOf(v));
+  const mine = live.filter(v => me && v.Owner === me);
+  if (mine.length) html += `<optgroup label="Your vehicles (${esc(me)})">` + mine.map(v => opt("v:" + v.Id, `${v.Name}${v.Modules.length ? " + " + v.Modules.length + " modules" : ""} · ${desc(cargoOf(v))}`)).join("") + "</optgroup>";
+  const types = [...new Set(live.map(v => v.Type))].sort();
+  if (types.length) html += `<optgroup label="On the server">` + types.map(t => { const v = bestOfType(t); return opt("t:" + t, `${v.Name} (${live.filter(x => x.Type === t).length} placed) · ${desc(cargoOf(v))}`); }).join("") + "</optgroup>";
+  const statics = Object.entries(VEHICLES).filter(([k]) => !types.includes(k + "Object"));
+  html += `<optgroup label="${types.length ? "Not placed on the server" : "Vehicles"}">` + statics.map(([k, v]) => opt("s:" + k, `${pretty(k)}${v.water ? " (boat)" : ""}${v.slots ? "" : " (set slots)"}`)).join("") + "</optgroup>";
+  sel.innerHTML = html;
+  // Keep the choice across reloads, mapping between a placed type (t:XObject), the static table (s:X) and older bare keys (X).
+  const values = [...sel.options].map(o => o.value);
+  const base = keep.startsWith("t:") ? staticKey(keep.slice(2)) : keep.startsWith("s:") ? keep.slice(2) : keep.includes(":") ? null : keep;
+  const tries = [keep, base && "t:" + base + "Object", base && "s:" + base, "t:PoweredCartObject", "s:PoweredCart"];
+  sel.value = tries.find(v => v && values.includes(v)) || values[0];
+  applyCargo();
+}
+function applyCargo() {
+  const c = vehicleSpec($("vehicle").value) || {};
+  CARGO = { storages: c.storages || [] };
+  const notes = cargoLimits(c);
+  if (c.modules && c.modules.length) notes.push("modules: " + c.modules.map(pretty).join(", "));
+  $("cargoNote").textContent = notes.length ? "Cargo: " + notes.join(" · ") : "";
+}
 function vehicleDefaults() {
-  const v = VEHICLES[$("vehicle").value] || {};
-  $("slots").value = v.slots ?? ""; $("maxkg").value = v.maxWeightKg ?? ""; $("speed").value = v.speed ?? "";
-  $("wrap").value = v.water ? "1" : "0";
-  if (!v.slots) $("settingsBox").open = true;
+  const c = vehicleSpec($("vehicle").value) || {};
+  $("slots").value = c.slots ?? ""; $("maxkg").value = c.maxWeightKg ?? ""; $("speed").value = c.speed ?? "";
+  $("wrap").value = c.water ? "1" : "0";
+  applyCargo();
+  if (!c.slots) $("settingsBox").open = true;
 }
 function saveForm() { for (const id of Object.keys(FIELDS)) store.set("f." + id, $(id).value); }
 function readSettings() {
@@ -429,7 +522,7 @@ function fillPlayers() {
 }
 
 // ---------------- start ----------------
-function setStart(s) { start = s; store.set("start", s); if (s?.kind === "player") store.set("me", s.name); picking = false; updatePickUi(); replan(); }
+function setStart(s) { start = s; store.set("start", s); if (s?.kind === "player") { store.set("me", s.name); fillVehicles(); } picking = false; updatePickUi(); replan(); }
 function renderStart() {
   const sp = startPosition();
   let t = "anywhere (runs begin at their first shop)";
