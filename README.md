@@ -28,6 +28,9 @@ point it elsewhere with `?server=https://your.server`.
 - **Runs**: multi-stop routes ranked by profit per minute. Each stop sells the load and buys a mixed load for the next
   leg, within the vehicle's slots and weight, your cash, the seller's stock, the buyer's demand, money and storage
   space. Spare room on a leg is filled with goods for a later stop (side deals).
+- **Storage space** at a buyer: the server's dry run of each delivery (per item, also for tag offers like "any Wood"),
+  plus the store's free slots shared by everything one run sells there. A store whose storage only takes non-carried
+  items gets no logs, whatever its offer says.
 - **Continue from <last stop>** plans the next run from where this one ends, assuming its trades happened.
   **Refresh** reloads the real state.
 - **Vehicle**: your own placed vehicles (when you picked your player), every vehicle type placed on the server, and a

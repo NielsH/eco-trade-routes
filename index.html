@@ -175,7 +175,7 @@ let start = store.get("start", null);   // null | {kind:"pos", x, z, label} | {k
 let tab = "runs", selected = null, hoverShop = null, picking = false, loadedAt = null;
 // Trades of runs you finished ("Continue from"), kept until fresh data shows them: the server caches /shops for up to
 // 60 s, so a sale from seconds ago can still be missing. DONE is the part not visible yet, subtracted while planning.
-let TRADES = { sells: {}, buys: {}, money: {} }, DONE = { sold: {}, bought: {}, money: {} }, tradeCheck = null;
+let TRADES = { sells: {}, buys: {}, money: {}, stored: {} }, DONE = { sold: {}, bought: {}, money: {}, stored: {} }, tradeCheck = null;
 const TRADE_TTL_MS = 3 * 60 * 1000;   // well past the server's 60 s cache: by then fresh data must include the trade
 const S = {};                            // settings, read from the form
 
@@ -218,7 +218,7 @@ async function load() {
       buys: s.Buys.map((o, n) => ({
         key: `${s.Id}/b${n}`, item: o.Item, tag: o.Tag, price: o.Price, limit: o.Limit,
         tagItems: o.Item ? null : (tagIndex[norm(o.Tag)] || []),
-        quantity: o.CanAccept ?? 999, unlimited: o.Wanted == null, wanted: o.Wanted, canAfford: o.CanAfford, canStore: o.CanStore,
+        quantity: o.CanAccept ?? 999, unlimited: o.Wanted == null, wanted: o.Wanted, canAfford: o.CanAfford, canStore: o.CanStore, canStoreItems: o.CanStoreItems || null,
       })),
     }));
     BYID = Object.fromEntries(SHOPS.map(s => [s.id, s]));
@@ -251,6 +251,10 @@ function recordTrades(r) {
     }
   }
   for (const leg of legs) {
+    const x = TRADES.stored[leg.to] ||= { shop: leg.to, items: {}, freeBefore: freeSlots(BYID[leg.to]), at: now };
+    for (const l of leg.load) x.items[l.item] = (x.items[l.item] || 0) + l.qty;
+  }
+  for (const leg of legs) {
     if (BYID[leg.to].balance === "infinite") continue;
     TRADES.money[leg.to] ||= { shop: leg.to, amount: 0, before: BYID[leg.to].balance || 0, at: now };
     TRADES.money[leg.to].amount += leg.revenue;
@@ -259,7 +263,7 @@ function recordTrades(r) {
 // After a reload: whatever the server already shows is taken as-is; only the rest stays in DONE. Trades fully visible, or
 // older than TRADE_TTL_MS, are forgotten. Approximate when other players trade at the same shops in between.
 function reconcile(sameData) {
-  const done = { sold: {}, bought: {}, money: {} }, now = Date.now();
+  const done = { sold: {}, bought: {}, money: {}, stored: {} }, now = Date.now();
   let seen = 0, total = 0;
   const unseen = (qty, before, after) => qty - Math.max(0, Math.min(qty, before - after));
   for (const [k, x] of Object.entries(TRADES.sells)) {
@@ -278,6 +282,12 @@ function reconcile(sameData) {
     const bal = BYID[x.shop]?.balance;
     const left = bal == null || bal === "infinite" ? 0 : x.amount - Math.max(0, Math.min(x.amount, x.before - bal));
     if (left > 0.01 && now - x.at < TRADE_TTL_MS) done.money[k] = left; else delete TRADES.money[k];
+  }
+  for (const [k, x] of Object.entries(TRADES.stored)) {   // the share of our slots the fresh free-slot count doesn't show yet
+    const s = BYID[x.shop], slots = s ? slotsFor(x.items) : 0, now_ = s ? freeSlots(s) : null;
+    const left = now_ == null || !slots ? 0 : 1 - Math.max(0, Math.min(slots, x.freeBefore - now_)) / slots;
+    if (left > 0.01 && now - x.at < TRADE_TTL_MS) done.stored[k] = Object.fromEntries(Object.entries(x.items).map(([i, q]) => [i, Math.ceil(q * left)]));
+    else delete TRADES.stored[k];
   }
   DONE = done;
   return total ? { seen, total, sameData } : null;
@@ -381,6 +391,35 @@ function density(c, legs, buyerMoney) {
   const cash = isFinite(S.cash) && S.cash > 0 ? c.so.price / S.cash : 0;
   return c.unit / Math.max(space, money, cash, 1e-12);
 }
+// Room in a buyer's storage. /shops reports its empty slots by what they take: Carried (stockpiles: logs, lumber, ...),
+// NonCarried, and Either. Deliveries fill whole slots at the item's stack size; stacks already in the store aren't
+// visible, except through the server's dry run of a delivery: CanStore for an item offer, CanStoreItems per item for a
+// tag offer (newer RecipeApi). Those include partial stacks and storage rules, but each assumes nothing else arrives
+// first, so the slot budget still applies on top. Without them (older RecipeApi, tag offers) the slots are all there is:
+// a store with no carried-item slots can't take logs.
+const freeSlots = s => s.emptySlots ? s.emptySlots.Carried + s.emptySlots.NonCarried + s.emptySlots.Either : null;
+function slotsFor(items) {
+  let n = 0;
+  for (const [name, q] of Object.entries(items || {})) n += Math.ceil(q / Math.max(1, itemInfo(name).stackSize));
+  return n;
+}
+function storeRoom(Y, name, stored, bo) {
+  const es = BYID[Y].emptySlots;
+  if (!es) return Infinity;   // older RecipeApi without EmptySlots
+  const it = itemInfo(name), stack = Math.max(1, it.stackSize);
+  let same = 0, other = 0;    // slots our other deliveries take: of this item's kind, and of the other kind
+  for (const [n2, q] of Object.entries(stored || {})) {
+    if (n2 === name) continue;
+    const i2 = itemInfo(n2), sl = Math.ceil(q / Math.max(1, i2.stackSize));
+    if (!!i2.carried === !!it.carried) same += sl; else other += sl;
+  }
+  const own = it.carried ? es.Carried : es.NonCarried, otherOwn = it.carried ? es.NonCarried : es.Carried;
+  const slots = Math.max(0, own + es.Either - Math.max(0, other - otherOwn) - same);
+  const exact = bo ? bo.canStore ?? bo.canStoreItems?.[name] : null;
+  const partial = exact != null ? Math.max(0, exact - (own + es.Either) * stack) : 0;   // room on stacks already there
+  const room = exact != null ? Math.min(exact, slots * stack + partial) : slots * stack;
+  return Math.max(0, room - ((stored || {})[name] || 0));
+}
 const moneyOf = (Y, used) => { const b = BYID[Y].balance; return b === "infinite" ? Infinity : (b || 0) - (DONE.money[Y] || 0) - (used || 0); };
 
 function fill(X, Y, st, slotsLeft, weightLeft, cash) {
@@ -390,6 +429,7 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
   const Ys = M.byId[Y];
   const yMoney = Ys.balance === "infinite" ? Infinity : (Ys.balance || 0) - (st.money[Y] || 0);
   const load = [], partial = {}, taken = {}, used = {};   // taken: per buy offer; used: per item of the seller's stock (two offers can want one item)
+  const stored = { ...(st.stored?.[Y]) };                  // what's in the buyer's storage from this plan, this leg included
   let usedSlots = 0, usedW = 0, cost = 0, revenue = 0;
   for (const { name, so, bo, unit } of cands) {
     const it = itemInfo(name);
@@ -403,8 +443,9 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
     const roomW = it.weightKg > 0 ? Math.floor((weightLeft - usedW) / it.weightKg) : Infinity;
     const afford = so.price > 0 ? Math.floor((cash - cost) / so.price) : Infinity;
     const payable = bo.price > 0 ? Math.floor((yMoney - revenue) / bo.price) : Infinity;
-    q = Math.floor(Math.min(q, roomSlots, roomW, afford, payable));
+    q = Math.floor(Math.min(q, roomSlots, roomW, afford, payable, storeRoom(Y, name, stored, bo)));
     if (!(q > 0)) continue;
+    stored[name] = (stored[name] || 0) + q;
     const newTotal = q - (partial[name] || 0);
     usedSlots += Math.max(0, Math.ceil(newTotal / stack));
     partial[name] = mod(-newTotal, stack);
@@ -416,8 +457,11 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
 }
 
 function apply(st, X, Y, load, revenue) {
-  const n = { sold: { ...st.sold }, bought: { ...st.bought }, money: { ...st.money } };
-  for (const l of load) { n.sold[X + "|" + l.item] = (n.sold[X + "|" + l.item] || 0) + l.qty; n.bought[l.offer] = (n.bought[l.offer] || 0) + l.qty; }
+  const n = { sold: { ...st.sold }, bought: { ...st.bought }, money: { ...st.money }, stored: { ...st.stored, [Y]: { ...st.stored?.[Y] } } };
+  for (const l of load) {
+    n.sold[X + "|" + l.item] = (n.sold[X + "|" + l.item] || 0) + l.qty; n.bought[l.offer] = (n.bought[l.offer] || 0) + l.qty;
+    n.stored[Y][l.item] = (n.stored[Y][l.item] || 0) + l.qty;
+  }
   n.money[Y] = (n.money[Y] || 0) + revenue;
   return n;
 }
@@ -491,12 +535,14 @@ function packRun(run) {
   lots.sort((a, b) => b.density - a.density);
   const slots = new Array(L).fill(0), w = new Array(L).fill(0), partial = Array.from({ length: L }, () => ({}));
   const cash = new Array(L).fill(S.cash);   // cash in hand when leaving stop k, after its buys
-  const sold = {}, bought = {}, paid = {}, picks = [];
+  const sold = {}, bought = {}, paid = {}, picks = [], stored = {};
+  const storedAt = Y => stored[Y] ||= { ...DONE.stored[Y] };
   for (const { i, j, name, so, bo, unit } of lots) {
     const X = path[i], Y = path[j], it = itemInfo(name), stack = stackOf(name), Ys = BYID[Y];
     let q = so.quantity - (DONE.sold[X + "|" + name] || 0) - (sold[X + "|" + name] || 0);
     if (!(bo.quantity === 999 && !bo.limit)) q = Math.min(q, bo.quantity - (DONE.bought[bo.key] || 0) - (bought[bo.key] || 0));
     if (Ys.balance !== "infinite" && bo.price > 0) q = Math.min(q, Math.floor(((Ys.balance || 0) - (DONE.money[Y] || 0) - (paid[Y] || 0)) / bo.price));
+    q = Math.min(q, storeRoom(Y, name, storedAt(Y), bo));
     for (let k = i; k < j; k++) {
       q = Math.min(q, (S.slots - slots[k]) * stack + (partial[k][name] || 0));
       if (it.weightKg > 0) q = Math.min(q, Math.floor((S.maxWeightKg - w[k]) / it.weightKg));
@@ -512,6 +558,7 @@ function packRun(run) {
     }
     for (let k = j; k < L; k++) cash[k] += revenue - cost;
     sold[X + "|" + name] = (sold[X + "|" + name] || 0) + q; bought[bo.key] = (bought[bo.key] || 0) + q; paid[Y] = (paid[Y] || 0) + q * bo.price;
+    storedAt(Y)[name] = (storedAt(Y)[name] || 0) + q;
     picks.push({ i, j, cost, revenue, line: { item: name, qty: q, buy: so.price, sell: bo.price, profit: q * unit, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown } });
   }
   const legs = run.legs.map((l, k) => {
@@ -546,6 +593,7 @@ function directDeals(startPos) {
       const limits = { "A stock": so.quantity - (DONE.sold[X + "|" + name] || 0),
         "B wants": bo.quantity === 999 && !bo.limit ? Infinity : bo.quantity - (DONE.bought[bo.key] || 0),
         "B money": B.balance === "infinite" ? Infinity : Math.floor(((B.balance || 0) - (DONE.money[Y] || 0)) / bo.price),
+        "B storage": storeRoom(Y, name, DONE.stored[Y], bo),
         "your cash": so.price > 0 ? Math.floor(S.cash / so.price) : Infinity, "vehicle": cap };
       const q = Math.min(...Object.values(limits));
       if (!(q > 0)) continue;
@@ -1023,6 +1071,7 @@ function shopDetail(s) {
     <td class="num">${buy ? (o.quantity === 999 && o.unlimited ? "any" : fmt(o.quantity, 0)) : fmt(o.quantity, 0)}</td></tr>`).join("");
   return `<div class="detail"><h2>${esc(s.name)}</h2>
     <div class="sub">${esc(s.owner)} · ${s.on && s.enabled ? "open" : "closed"} · ${esc(s.currency || "barter")} · money ${s.balance === "infinite" ? "∞" : fmt(s.balance ?? 0)} · x ${Math.round(s.x)}, z ${Math.round(s.z)}</div>
+    ${s.emptySlots ? `<div class="sub">Empty storage slots: ${s.emptySlots.Carried} for carried items (logs, lumber, …) · ${s.emptySlots.NonCarried} for other items · ${s.emptySlots.Either} for either</div>` : ""}
     <div class="row" style="margin-top:6px"><button class="primary" data-start="${s.id}">Start here</button></div>
     <table class="offers"><tr><th>Sells</th><th class="num">price</th><th class="num">stock</th></tr>${rows(s.sells, false) || '<tr><td colspan="3">—</td></tr>'}</table>
     <table class="offers"><tr><th>Buys</th><th class="num">price</th><th class="num">can take</th></tr>${rows(s.buys, true) || '<tr><td colspan="3">—</td></tr>'}</table></div>`;
