@@ -293,6 +293,11 @@ const minutes = (a, b) => dist(a, b) * S.routeFactor / S.speed / 60;
 // Routed travel times (routing.js): shop to shop for the open shops of the current market (ROUTE), and from the start
 // (START_ROW, a single cheap search, so moving the start doesn't redo the matrix). Straight-line times until they land.
 let ROUTE = null, START_ROW = null, routeWanted = null, rowWanted = null, routeProgress = null, routesOn = false, rowOn = false;
+// routeGen counts map reloads: routes from an older map stay in use until the new ones are ready. routingFailed: the map
+// or routing couldn't load, so plans fall back to straight lines (said so in the status line).
+let routeGen = 0, routingFailed = false;
+const routingMessage = () => !window.Routing?.ready ? "Loading the map for routing…" : `Calculating routes over roads and terrain… ${Math.round((routeProgress || 0) * 100)}%`;
+const routingPending = () => S.routing === "terrain" && !routingFailed && (!routesOn || (!!startPosition() && !rowOn));
 const routeParams = () => ({ mode: S.water ? "water" : "land", roadMult: S.water ? 1 : S.roadMult, offroad: S.water ? 1 : S.offroad });
 const matrixKey = () => JSON.stringify([routeParams(), M ? M.open.map(s => s.id) : []]);
 const rowKey = sp => matrixKey() + JSON.stringify(sp ? [Math.round(sp.x), Math.round(sp.z)] : null);
@@ -306,23 +311,23 @@ function leadMinutes(startPos, X) {
 }
 // Decides, once per plan, whether the routed times match the current market and start; requests whatever is missing.
 function syncRoutes() {
-  const on = S.routing === "terrain" && window.Routing?.ready && M, sp = startPosition();
-  routesOn = !!(on && ROUTE && ROUTE.key === matrixKey());
-  rowOn = !!(routesOn && sp && START_ROW && START_ROW.key === rowKey(sp));
+  const on = S.routing === "terrain" && !routingFailed && window.Routing?.ready && M, sp = startPosition();
+  const mk = matrixKey(), rk = sp && rowKey(sp);
+  routesOn = !!(on && ROUTE && ROUTE.key === mk);
+  rowOn = !!(routesOn && sp && START_ROW && START_ROW.key === rk);
   if (!on) return;
-  const shops = M.open, mk = matrixKey();
-  if (!routesOn && routeWanted !== mk) {
-    routeWanted = mk; routeProgress = 0;
-    Routing.matrix(routeParams(), shops.map(s => s.position), f => { if (routeWanted === mk) { routeProgress = f; showStatus(); } })
-      .then(r => { if (routeWanted !== mk) return; ROUTE = { key: mk, n: r.n, times: r.times, index: new Map(shops.map((s, i) => [s.id, i])) }; routeWanted = null; replan(); })
-      .catch(e => { routeWanted = null; console.error(e); $("status").textContent += " · routing failed: " + e.message; });
+  const shops = M.open, gen = routeGen, failed = e => { console.error(e); routingFailed = true; routeWanted = rowWanted = null; replan(); };
+  if (!(routesOn && ROUTE.gen === gen) && routeWanted !== mk + "#" + gen) {
+    const want = routeWanted = mk + "#" + gen; routeProgress = 0;
+    Routing.matrix(routeParams(), shops.map(s => s.position), f => { if (routeWanted === want) { routeProgress = f; showStatus(); if (!routesOn) render(); } })
+      .then(r => { if (routeWanted !== want) return; ROUTE = { key: mk, gen, n: r.n, times: r.times, index: new Map(shops.map((s, i) => [s.id, i])) }; routeWanted = null; replan(); })
+      .catch(failed);
   }
-  const rk = sp && rowKey(sp);
-  if (sp && !rowOn && rowWanted !== rk) {
-    rowWanted = rk;
+  if (sp && !(rowOn && START_ROW.gen === gen) && rowWanted !== rk + "#" + gen) {
+    const want = rowWanted = rk + "#" + gen;
     Routing.row(routeParams(), sp, shops.map(s => s.position))
-      .then(times => { if (rowWanted !== rk) return; START_ROW = { key: rk, times }; rowWanted = null; replan(); })
-      .catch(e => { rowWanted = null; console.error(e); });
+      .then(times => { if (rowWanted !== want) return; START_ROW = { key: rk, gen, times }; rowWanted = null; replan(); })
+      .catch(failed);
   }
 }
 const itemInfo = name => ITEMS[name] || { weightKg: 0, stackSize: 100, carried: false, unknown: true };
@@ -567,6 +572,11 @@ function doReplan() {
   const t0 = performance.now();
   M = buildMarket();
   syncRoutes();
+  if (routingPending()) {   // no straight-line stand-ins: wait for the routes (about 1-4 s), the list says so
+    RUNS = []; DEALS = []; lastPlanMs = 0;
+    showStatus(); renderStart(); render(); draw();
+    return;
+  }
   const sp = startPosition();
   const runs = plan(sp).filter(r => r.legs.length >= S.minLegs);
   runs.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
@@ -584,9 +594,9 @@ let lastPlanMs = 0;
 function showStatus() {
   if (!M) return;
   let routing = "straight-line times";
-  if (S.routing === "terrain") routing = routesOn ? "routed over roads and terrain"
-    : !window.Routing?.ready ? "straight-line times until the map is loaded"
-    : `routing ${Math.round((routeProgress || 0) * 100)}% (straight-line times until done)`;
+  if (S.routing === "terrain") routing = routingFailed ? "straight-line times (the map couldn't be loaded for routing)"
+    : routingPending() ? routingMessage().replace("…", "").toLowerCase()
+    : "routed over roads and terrain";
   $("status").textContent = `${M.open.length} open ${S.currency} shops · ${M.pairs.size} profitable pairs · ${routing} · planned in ${fmt(lastPlanMs, 0)} ms · data ${loadedAt ? new Date(loadedAt).toLocaleTimeString() : "?"}`;
 }
 
@@ -734,16 +744,18 @@ const HEIGHT = new Image(); HEIGHT.crossOrigin = "anonymous";   // routing: bloc
 let SEA = null, PATHS = new Map();
 IMG.onload = () => { draw(); setupRouting(); };
 HEIGHT.onload = () => setupRouting();
+IMG.onerror = HEIGHT.onerror = () => { routingFailed = true; replan(); };
 function loadMap() {
   const t = Date.now();
+  routingFailed = !window.Routing || !window.TERRAIN_COLORS;
   IMG.src = SERVER + "/Layers/TerrainLatest.gif?t=" + t; HEIGHT.src = SERVER + "/Layers/HeightMapLatest.gif?t=" + t;
   Promise.all([getJSON(SERVER + "/api/v1/map/waterLevel"), getJSON(SERVER + "/api/v1/map/dimension")])
     .then(([level, dim]) => { SEA = level * dim.y; setupRouting(); }).catch(() => { SEA = 60; setupRouting(); });   // 60 = Eco's default (0.375 x 160)
 }
 function setupRouting() {
   if (!window.Routing || !IMG.complete || !IMG.naturalWidth || !HEIGHT.complete || !HEIGHT.naturalWidth || SEA == null) return;
-  try { Routing.setup(IMG, HEIGHT, SEA); ROUTE = START_ROW = null; routeWanted = rowWanted = null; PATHS = new Map(); replan(); }
-  catch (e) { console.error(e); }
+  try { Routing.setup(IMG, HEIGHT, SEA); routeGen++; routeWanted = rowWanted = null; PATHS = new Map(); replan(); }
+  catch (e) { console.error(e); routingFailed = true; replan(); }
 }
 // The routed path of a leg, fetched on demand for drawing; null while it's computed or when routing is off.
 function legPath(a, b) {
@@ -794,7 +806,8 @@ function arrow(a, b, color, width, label, dashed) {
 // A leg along its routed path (falls back to the straight arrow while the path is computed or unreachable).
 function routeArrow(a, b, color, width, text, dashed) {
   const r = legPath(a, b);
-  if (!r || !r.points || r.points.length < 2) return arrow(a, b, color, width, text, true);
+  if (!r) return;                                                          // being computed (tens of ms): drawn when it lands
+  if (!r.points || r.points.length < 2) return arrow(a, b, color, width, text, true);
   const pts = r.points.map(p => toScreen(p.x, p.z));
   ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width; ctx.lineCap = "round"; ctx.lineJoin = "round";
   if (dashed) ctx.setLineDash([6, 5]);
@@ -931,7 +944,8 @@ function render() {
       }
       html += `</div>`;
     });
-    if (!html) html = `<div class="empty">No runs${start ? " from this start" : ""}. Try more legs, another vehicle or a different start.</div>`;
+    if (!html) html = routingPending() ? `<div class="status">${routingMessage()}</div>`
+      : `<div class="empty">No runs${start ? " from this start" : ""}. Try more legs, another vehicle or a different start.</div>`;
   } else if (tab === "deals") {
     DEALS.forEach((d, i) => {
       if (q && !(pretty(d.name) + " " + BYID[d.X].name + " " + BYID[d.Y].name + " " + (d.viaTag || "")).toLowerCase().includes(q)) return;
@@ -941,7 +955,8 @@ function render() {
         <div class="path">${shopName(d.X)} (${fmt(d.buy, 2)}) → ${shopName(d.Y)} (${fmt(d.sell, 2)})</div>
         <div class="path">${fmt(d.q, 0)} per trip · limited by ${esc(d.limitedBy)}${d.lead > 0.05 ? ` · ${fmt(d.lead)} min to get there` : ""}</div></div>`;
     });
-    if (!html) html = `<div class="empty">No direct deals.</div>`;
+    if (!html) html = routingPending() ? `<div class="status">${routingMessage()}</div>`
+      : `<div class="empty">No direct deals.</div>`;
   } else {
     if (selected?.kind === "shop" && BYID[selected.id]) html += shopDetail(BYID[selected.id]);
     SHOPS.filter(s => !q || (s.name + " " + (s.owner || "") + " " + s.sells.concat(s.buys).map(o => pretty(o.item || o.tag)).join(" ")).toLowerCase().includes(q))
