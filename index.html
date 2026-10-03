@@ -883,14 +883,12 @@ const drawLeg = (a, b, color, width, text, dashed) => S.routing === "terrain" &&
 // its own colour, with arrows along it. The card's drive lines use the same colours; hovering one fades the others.
 const LEG_COLORS = ["#ff7a3d", "#12b886", "#e64980", "#f6c026", "#4c6ef5", "#82c91e", "#fa5252", "#15aabf"];
 const legColor = k => LEG_COLORS[k % LEG_COLORS.length];
-// Screen points of a leg: its routed path, or the straight line when routing is off or found no path; null while computing.
+// Screen points of a leg's routed path; null while it's computed, { none: true } when routing found no path.
 function legScreenPoints(a, b) {
-  if (S.routing === "terrain" && !S.water) {
-    const r = legPath(a, b);
-    if (!r) return null;
-    if (r.points && r.points.length >= 2) return smooth(dedupe(r.points.map(p => toScreen(p.x, p.z))));
-  }
-  return [toScreen(a.x, a.z), toScreen(b.x, b.z)];
+  const r = legPath(a, b);
+  if (!r) return null;
+  if (!r.points || r.points.length < 2) return { none: true };
+  return smooth(dedupe(r.points.map(p => toScreen(p.x, p.z))));
 }
 function dedupe(pts) {   // zoomed out, many path cells share a pixel
   const out = [pts[0]];
@@ -938,10 +936,13 @@ function strokeLane(pts, color, width, faded) {
 }
 function drawLegs(legs) {   // legs: [{ from, to }] as positions
   const width = 3.2, lanes = [];
+  const routed = S.routing === "terrain" && !S.water;   // the same test as drawLeg: straight arrows only when routing is off or for boats
   legs.forEach((l, k) => {
-    const pts = S.wrap ? null : legScreenPoints(l.from, l.to);
-    if (S.wrap) return arrow(l.from, l.to, legColor(k), width, "", false);
-    if (pts) lanes.push({ k, pts: offsetLine(pts, 3 + k * 3) });
+    if (!routed) return arrow(l.from, l.to, legColor(k), width, "", false);
+    const pts = legScreenPoints(l.from, l.to);
+    if (!pts) return;                                                            // being computed: drawn when it lands
+    if (pts.none) return arrow(l.from, l.to, legColor(k), width, "", true);       // no route found: dashed, as before
+    lanes.push({ k, pts: offsetLine(pts, 3 + k * 3) });
   });
   const order = lanes.filter(l => l.k !== hoverLeg).concat(lanes.filter(l => l.k === hoverLeg));   // the hovered leg on top
   for (const l of order) strokeLane(l.pts, legColor(l.k), hoverLeg === l.k ? width + 1.5 : width, hoverLeg != null && hoverLeg !== l.k);
