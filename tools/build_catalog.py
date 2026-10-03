@@ -123,12 +123,13 @@ def main():
             "maxWeightKg": int(s.group(2)) / 1000 if s else None,
             "restriction": (s.group(3) or "").strip() or None if s else None,
             "speed": float(v.group(1)),
+            "roadMult": float(v.group(2)),  # VehicleComponent roadEfficiencyMultiplier: surface factor = 1 + (MoveEfficiency - 1) * this
             "water": "BoatComponent" in src,  # the 5th VehicleComponent.Initialize arg is isDrivenUnderwater, not "is a boat"
             "modular": "ModularVehicleComponent" in src,
             "note": "storage comes from fitted modules: fill in slots/maxWeightKg by hand" if "ModularVehicleComponent" in src and not s else None,
         }
     # Not a vehicle, but a useful baseline: walking with backpack + carried slot. Fill in from your own inventory.
-    vehicles["OnFoot"] = {"slots": None, "maxWeightKg": None, "restriction": None, "speed": 5.0, "water": False,
+    vehicles["OnFoot"] = {"slots": None, "maxWeightKg": None, "restriction": None, "speed": 5.0, "water": False, "roadMult": 0.0,
                           "modular": False, "note": "fill in your backpack slots and weight limit"}
 
     os.makedirs(a.out, exist_ok=True)
@@ -142,7 +143,7 @@ def main():
     # The web page reads the same table from vehicles.js at the repo root.
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
     def slim_entry(v):
-        out = {f: v.get(f) for f in ("slots", "maxWeightKg", "speed", "water")}
+        out = {f: v.get(f) for f in ("slots", "maxWeightKg", "speed", "water", "roadMult")}
         tags = re.findall(r'TagRestriction\(\s*"([^"]+)"', v.get("restriction") or "")
         if tags:  # same shape the page gets from /vehicles, by tag because the static table has no item list
             out["storages"] = [{"Accepts": {"OnlyTags": tags}}]

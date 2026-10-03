@@ -12,7 +12,8 @@ It reads the server live:
 | `/api/v1/plugins/RecipeApi/players` | online players' positions, to plan from where you stand |
 | `/api/v1/plugins/RecipeApi/vehicles` | placed vehicles with their real cargo storage: slots, weight, exactly which items fit and how many per slot, fitted modules |
 | `/api/v1/plugins/RecipeApi/tags` | fallback for tag offers on servers whose `/items` has no `Tags` yet |
-| `/Layers/TerrainLatest.gif` | the server's own 2D map, used as the backdrop |
+| `/Layers/TerrainLatest.gif` | the server's own 2D map: the backdrop, and roads/ground/water for routing |
+| `/Layers/HeightMapLatest.gif`, `/api/v1/map/waterLevel`, `/api/v1/map/dimension` | block heights and sea level, for routing |
 
 The `RecipeApi` routes come from the [EcoRecipeApi](https://github.com/NielsH/eco-recipe-api) server mod. Eco's web
 server sends `Access-Control-Allow-Origin: *`, so a page on any host can read them.
@@ -37,7 +38,23 @@ point it elsewhere with `?server=https://your.server`.
   factor (road distance / straight line) and a sale bonus %. Turn on edge wrap for boats only: on a world ringed by
   ocean, land vehicles can't cross the edge.
 
-Travel time is straight-line distance × road factor ÷ vehicle speed, so treat the minutes as an estimate.
+## Routing
+
+Travel times are routed over the real map (`routing.js`, in a background worker; about a second for 100 shops):
+
+- **Roads** are read from the map colours (dirt road 1.0, stone road 1.1, asphalt 1.2: Eco's `Road` efficiency). A
+  vehicle's speed on a surface is `1 + (efficiency − 1) × road multiplier`, as in Eco's client (Powered Cart 1.5,
+  Truck 4: trucks gain most from roads).
+- **Off road** is slower: the off-road speed setting (default 0.5), more so on bumpy ground (from the height map) and in
+  forest biomes (trees aren't on the map but block vehicles).
+- **Water** is impassable for land vehicles unless something is built on it (a bridge). Boats only move on water and
+  can reach a shop within about 12 blocks of it. The map doesn't draw water, so it's inferred: riverbed, or natural
+  ground below sea level.
+- **Cliffs and walls** (more than one block up per block) can't be driven.
+- **Not visible from above**: tunnels, and anything under a roof. Shops that can't be reached are left out of runs.
+
+The map shows each leg along its route with its share on roads. Switch "Travel time" to "straight line × road factor"
+for the old estimate. Minutes are still estimates: the speed scale isn't calibrated against real trips yet.
 
 ## Tools (optional, Python)
 
@@ -49,5 +66,6 @@ from the repo root; they read and write `data/` (git-ignored).
 | `fetch_shops.py` | live `/shops` + `/items` into `data/shops.json` and `data/items.json` |
 | `plan_routes.py` | multi-stop runs (`--vehicle`, `--cash`, `--start "Shop" \| x,z`, `--legs`) |
 | `find_routes.py` | direct A→B deals |
+| `build_terrain_colors.py` | regenerate `terrain-colors.js` (what each map colour means for driving) from an Eco source checkout: `--eco <Eco>/Server` |
 | `build_catalog.py` | regenerate `vehicles.js` (and `data/items.json`) from an Eco source checkout: `--eco <Eco>/Server [--server <server>/Mods/UserCode]` |
 | `extract_shops.py` | shops from a save file (`Game.eco`) instead of the API; needs a sibling clone of [eco-save-reader](https://github.com/NielsH/eco-save-reader) |
