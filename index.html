@@ -57,12 +57,22 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .big { font-weight: 600; font-variant-numeric: tabular-nums; }
 .rate { color: var(--good); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .path { color: var(--muted); font-size: 12px; margin-top: 2px; }
-.legs { margin: 6px 0 4px; padding: 0; list-style: none; font-size: 12px; }
-.legs li { padding: 3px 0 3px 22px; position: relative; }
-.legs li .n { position: absolute; left: 0; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--route); color: #fff; font-size: 10px; display: grid; place-items: center; font-weight: 700; }
-.legs li.side .n { background: var(--side); }
-.legs li.lead .n { background: var(--start); }
-.goods { color: var(--muted); }
+.steps { margin: 8px 0 4px; }
+.stop { border-left: 2px solid var(--route); margin-left: 8px; padding: 0 0 6px 14px; }
+.stop-head { display: flex; align-items: center; gap: 8px; margin-left: -24px; padding: 2px 0 4px; font-weight: 600; }
+.stop-head .n { width: 18px; height: 18px; border-radius: 50%; background: var(--route); color: #fff; font-size: 11px; display: grid; place-items: center; flex: none; }
+.act { display: grid; grid-template-columns: 34px 52px 1fr auto; gap: 8px; align-items: baseline; padding: 2px 0; }
+.act .verb { font-size: 10.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.act.buy .verb { color: var(--start); }
+.act.sell .verb { color: var(--good); }
+.act .qty { font-size: 15px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+.act .what { min-width: 0; }
+.act .note { color: var(--side); font-size: 11px; margin-left: 4px; white-space: nowrap; }
+.act .price { color: var(--muted); font-size: 11.5px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.drive { color: var(--muted); font-size: 12px; margin-left: 8px; padding: 3px 0 7px 14px; border-left: 2px dashed var(--line); }
+.drive.start { border-left-color: var(--start); }
+.steps .summary { color: var(--muted); font-size: 12px; padding: 4px 0 2px; }
+.steps .summary b { color: var(--ink); }
 main { position: relative; min-width: 0; min-height: 0; background: var(--map-bg); overflow: hidden; }
 canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
 canvas.drag { cursor: grabbing; }
@@ -356,17 +366,29 @@ function buildMarket() {
   return { open, byId, pairs, out };
 }
 
+// Greedy packing order: profit per unit of the scarcest resource a unit uses, each as a share of what's available:
+// cargo space (slots or weight, times the legs it rides), the buyer's money, and your cash when it's limited.
+// Ranking by space alone spends a poor buyer's money on low-margin goods.
+function density(c, legs, buyerMoney) {
+  const it = itemInfo(c.name);
+  const space = Math.max(1 / stackOf(c.name) / S.slots, it.weightKg / S.maxWeightKg) * legs;
+  const money = isFinite(buyerMoney) && buyerMoney > 0 ? c.bo.price / buyerMoney : 0;
+  const cash = isFinite(S.cash) && S.cash > 0 ? c.so.price / S.cash : 0;
+  return c.unit / Math.max(space, money, cash, 1e-12);
+}
+const moneyOf = (Y, used) => { const b = BYID[Y].balance; return b === "infinite" ? Infinity : (b || 0) - (DONE.money[Y] || 0) - (used || 0); };
+
 function fill(X, Y, st, slotsLeft, weightLeft, cash) {
   const cands = [...(M.pairs.get(X + "|" + Y) || [])];
-  const dens = c => { const it = itemInfo(c.name); return c.unit / Math.max(1 / stackOf(c.name) / S.slots, it.weightKg / S.maxWeightKg); };
+  const ym = moneyOf(Y, (st.money[Y] || 0) - (DONE.money[Y] || 0)), dens = c => density(c, 1, ym);
   cands.sort((a, b) => dens(b) - dens(a));
   const Ys = M.byId[Y];
   const yMoney = Ys.balance === "infinite" ? Infinity : (Ys.balance || 0) - (st.money[Y] || 0);
-  const load = [], partial = {}, taken = {};
+  const load = [], partial = {}, taken = {}, used = {};   // taken: per buy offer; used: per item of the seller's stock (two offers can want one item)
   let usedSlots = 0, usedW = 0, cost = 0, revenue = 0;
   for (const { name, so, bo, unit } of cands) {
     const it = itemInfo(name);
-    const avail = so.quantity - (st.sold[X + "|" + name] || 0);
+    const avail = so.quantity - (st.sold[X + "|" + name] || 0) - (used[name] || 0);
     let want = bo.quantity - (st.bought[bo.key] || 0) - (taken[bo.key] || 0);
     if (bo.quantity === 999 && !bo.limit) want = Infinity;
     let q = Math.min(avail, want);
@@ -382,7 +404,7 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
     usedSlots += Math.max(0, Math.ceil(newTotal / stack));
     partial[name] = mod(-newTotal, stack);
     usedW += q * it.weightKg; cost += q * so.price; revenue += q * bo.price * (1 + S.bonus);
-    taken[bo.key] = (taken[bo.key] || 0) + q;
+    taken[bo.key] = (taken[bo.key] || 0) + q; used[name] = (used[name] || 0) + q;
     load.push({ item: name, qty: q, buy: so.price, sell: bo.price, profit: q * unit, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown });
   }
   return { load, slots: usedSlots, w: usedW, cost, revenue };
@@ -451,6 +473,62 @@ function sideDeals(run) {
   return run;
 }
 
+// Joint packing of a run whose stops are fixed. Every "buy at stop i, sell at stop j > i" lot competes for the cargo space
+// of all the legs it rides along: ranked by profit per unit of space per leg occupied (so carrying something three legs
+// costs three legs of space), then packed against each leg's slots and weight, the seller's stock, the buyer's demand and
+// money, and your cash over time (sales along the way pay for later buys). Same result shape as fill + sideDeals.
+function packRun(run) {
+  const path = run.path, L = path.length - 1, lots = [];
+  for (let i = 0; i < L; i++) for (let j = i + 1; j <= L; j++)
+    for (const c of M.pairs.get(path[i] + "|" + path[j]) || []) {
+      lots.push({ ...c, i, j, density: density(c, j - i, moneyOf(path[j])) });
+    }
+  lots.sort((a, b) => b.density - a.density);
+  const slots = new Array(L).fill(0), w = new Array(L).fill(0), partial = Array.from({ length: L }, () => ({}));
+  const cash = new Array(L).fill(S.cash);   // cash in hand when leaving stop k, after its buys
+  const sold = {}, bought = {}, paid = {}, picks = [];
+  for (const { i, j, name, so, bo, unit } of lots) {
+    const X = path[i], Y = path[j], it = itemInfo(name), stack = stackOf(name), Ys = BYID[Y];
+    let q = so.quantity - (DONE.sold[X + "|" + name] || 0) - (sold[X + "|" + name] || 0);
+    if (!(bo.quantity === 999 && !bo.limit)) q = Math.min(q, bo.quantity - (DONE.bought[bo.key] || 0) - (bought[bo.key] || 0));
+    if (Ys.balance !== "infinite" && bo.price > 0) q = Math.min(q, Math.floor(((Ys.balance || 0) - (DONE.money[Y] || 0) - (paid[Y] || 0)) / bo.price));
+    for (let k = i; k < j; k++) {
+      q = Math.min(q, (S.slots - slots[k]) * stack + (partial[k][name] || 0));
+      if (it.weightKg > 0) q = Math.min(q, Math.floor((S.maxWeightKg - w[k]) / it.weightKg));
+      if (so.price > 0) q = Math.min(q, Math.floor(cash[k] / so.price));
+    }
+    q = Math.floor(q);
+    if (!(q > 0)) continue;
+    const cost = q * so.price, revenue = q * bo.price * (1 + S.bonus);
+    for (let k = i; k < j; k++) {
+      const added = q - (partial[k][name] || 0);
+      slots[k] += Math.max(0, Math.ceil(added / stack)); partial[k][name] = mod(-added, stack);
+      w[k] += q * it.weightKg; cash[k] -= cost;
+    }
+    for (let k = j; k < L; k++) cash[k] += revenue - cost;
+    sold[X + "|" + name] = (sold[X + "|" + name] || 0) + q; bought[bo.key] = (bought[bo.key] || 0) + q; paid[Y] = (paid[Y] || 0) + q * bo.price;
+    picks.push({ i, j, cost, revenue, line: { item: name, qty: q, buy: so.price, sell: bo.price, profit: q * unit, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown } });
+  }
+  const legs = run.legs.map((l, k) => {
+    const own = picks.filter(p => p.i === k && p.j === k + 1);
+    return { ...l, load: own.map(p => p.line), slots: slots[k], w: w[k], cost: own.reduce((n, p) => n + p.cost, 0), revenue: own.reduce((n, p) => n + p.revenue, 0) };
+  });
+  const side = [];
+  for (const p of picks.filter(p => p.j > p.i + 1)) {
+    let g = side.find(sd => sd.fromStop === p.i && sd.toStop === p.j);
+    if (!g) side.push(g = { from: path[p.i], to: path[p.j], fromStop: p.i, toStop: p.j, load: [], cost: 0, revenue: 0 });
+    g.load.push(p.line); g.cost += p.cost; g.revenue += p.revenue;
+  }
+  let st = DONE;
+  for (const p of picks) st = apply(st, path[p.i], path[p.j], [p.line], p.revenue);
+  return { ...run, legs, side, st, profit: picks.reduce((n, p) => n + p.revenue - p.cost, 0) };
+}
+// The better of joint packing and the leg-by-leg fill (+ side deals in leftover space); packing is greedy too, so keep both.
+function bestPacking(run) {
+  const old = sideDeals(run), packed = packRun(run);
+  return packed.profit > old.profit + 1e-6 ? packed : old;
+}
+
 function directDeals(startPos) {
   const deals = [];
   for (const [k, cands] of M.pairs) {
@@ -493,8 +571,9 @@ function doReplan() {
   const runs = plan(sp).filter(r => r.legs.length >= S.minLegs);
   runs.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
   const seen = new Set(); RUNS = [];
-  for (const r of runs) { const k = r.path.join(">"); if (seen.has(k)) continue; seen.add(k); RUNS.push(sideDeals(r)); if (RUNS.length >= 40) break; }
-  RUNS.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
+  for (const r of runs) { const k = r.path.join(">"); if (seen.has(k)) continue; seen.add(k); RUNS.push(bestPacking(r)); if (RUNS.length >= 120) break; }
+  RUNS.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);   // packing can lift a run, so re-rank before cutting
+  RUNS = RUNS.slice(0, 40);
   DEALS = directDeals(sp);
   if (selected && selected.kind !== "shop") selected = RUNS.length ? { kind: "run", i: 0 } : null;
   if (!selected && RUNS.length) selected = { kind: "run", i: 0 };
@@ -831,7 +910,6 @@ $("theme").onclick = () => {
 function selectTab(t) { tab = t; document.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.tab === t)); render(); }
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => selectTab(b.dataset.tab));
 $("q").addEventListener("input", render);
-const goods = load => load.map(l => `${fmt(l.qty, 0)} ${esc(pretty(l.item))}${l.viaTag ? ` (as ${esc(l.viaTag)})` : ""}${l.unknown ? " ⚠" : ""}`).join(", ");
 const shopName = id => esc(BYID[id]?.name || "?");
 
 function render() {
@@ -847,14 +925,8 @@ function render() {
         <div class="top"><span class="big">+${fmt(r.profit)} ${esc(S.currency)}</span><span class="rate">${fmt(r.profit / r.minutes)}/min · ${fmt(r.minutes)} min</span></div>
         <div class="path">${r.path.map(shopName).join(" → ")}</div>`;
       if (sel) {
-        html += `<ol class="legs">`;
-        if (r.lead > 0.05) html += `<li class="lead"><span class="n">↗</span>Drive from your start to ${shopName(r.path[0])} · ${fmt(r.lead)} min</li>`;
-        const roadShare = l => { const p = S.routing === "terrain" && !S.water && PATHS.get(JSON.stringify([routeParams(), Math.round(BYID[l.from].x), Math.round(BYID[l.from].z), Math.round(BYID[l.to].x), Math.round(BYID[l.to].z)])); return p && p.points ? ` · ${fmt(l.minutes - S.stopMinutes)} min, ${Math.round(p.onRoad * 100)}% road` : ""; };
-        html += r.legs.map((l, k) => `<li><span class="n">${k + 1}</span>${shopName(l.from)} → ${shopName(l.to)} <b>+${fmt(l.revenue - l.cost)}</b>${roadShare(l)}
-            · ${l.slots}/${S.slots} slots, ${fmt(l.w, 0)} kg · cash out ${fmt(l.cost)}<div class="goods">${goods(l.load)}</div></li>`).join("");
-        html += r.side.map(sd => `<li class="side"><span class="n">+</span>Side deal: buy at stop ${sd.fromStop + 1}, sell at stop ${sd.toStop + 1}
-            <b>+${fmt(sd.revenue - sd.cost)}</b><div class="goods">${goods(sd.load)}</div></li>`).join("");
-        html += `</ol><div class="row"><button class="primary" data-continue="${i}">Continue from ${shopName(r.path[r.path.length - 1])}</button></div>`;
+        html += runCard(r);
+        html += `<div class="row"><button class="primary" data-continue="${i}">Continue from ${shopName(r.path[r.path.length - 1])}</button></div>`;
       }
       html += `</div>`;
     });
@@ -898,6 +970,37 @@ function render() {
     loadMap(); await load();   // you just traded: plan the next run on fresh data
   });
   list.querySelectorAll("[data-start]").forEach(b => b.onclick = () => setStart({ kind: "shop", id: b.dataset.start }));
+}
+// A run as instructions: at each stop what to sell and what to buy (quantity first), then the drive to the next stop.
+function runCard(r) {
+  const stops = r.path.map(() => ({ sell: [], buy: [] }));
+  r.legs.forEach((leg, k) => leg.load.forEach(l => { stops[k].buy.push({ ...l, to: k + 1 }); stops[k + 1].sell.push(l); }));
+  r.side.forEach(sd => sd.load.forEach(l => { stops[sd.fromStop].buy.push({ ...l, to: sd.toStop }); stops[sd.toStop].sell.push(l); }));
+  let bal = 0, need = 0;   // cash needed up front: sales at a stop come before its purchases
+  for (const s of stops) { for (const l of s.sell) bal += l.qty * l.sell * (1 + S.bonus); for (const l of s.buy) bal -= l.qty * l.buy; need = Math.max(need, -bal); }
+  const line = (verb, l, k) => {
+    const price = verb === "buy" ? l.buy : l.sell, notes = [];
+    if (l.viaTag) notes.push("as " + esc(l.viaTag));
+    if (verb === "buy" && l.to > k + 1) notes.push("for stop " + (l.to + 1));
+    if (l.unknown) notes.push("⚠ no item data");
+    return `<div class="act ${verb}"><span class="verb">${verb}</span><span class="qty">${fmt(l.qty, 0)}</span>` +
+      `<span class="what">${esc(pretty(l.item))}${notes.map(n => `<span class="note">${n}</span>`).join("")}</span>` +
+      `<span class="price">${fmt(price, 2)} ea · ${fmt(l.qty * price)}</span></div>`;
+  };
+  const roadText = (a, b) => {
+    const p = S.routing === "terrain" && !S.water && PATHS.get(JSON.stringify([routeParams(), Math.round(a.x), Math.round(a.z), Math.round(b.x), Math.round(b.z)]));
+    return p && p.points ? ` · ${Math.round(p.onRoad * 100)}% road` : "";
+  };
+  let html = `<div class="steps">`;
+  if (r.lead > 0.05) html += `<div class="drive start">Drive to the first stop · ${fmt(r.lead)} min${roadText(startPosition(), BYID[r.path[0]])}</div>`;
+  r.path.forEach((id, k) => {
+    html += `<div class="stop"><div class="stop-head"><span class="n">${k + 1}</span>${shopName(id)}</div>` +
+      stops[k].sell.map(l => line("sell", l, k)).join("") + stops[k].buy.map(l => line("buy", l, k)).join("") + `</div>`;
+    const leg = r.legs[k];
+    if (leg) html += `<div class="drive">${fmt(leg.minutes - S.stopMinutes)} min${roadText(BYID[leg.from], BYID[leg.to])} · cargo ${leg.slots}/${S.slots} slots, ${fmt(leg.w, 0)} kg</div>`;
+  });
+  html += `<div class="summary">Profit <b>+${fmt(r.profit)} ${esc(S.currency)}</b> · ${fmt(r.minutes)} min incl. ${fmt(S.stopMinutes)} min per stop · needs <b>${fmt(need)}</b> cash up front</div></div>`;
+  return html;
 }
 function shopDetail(s) {
   const rows = (offers, buy) => offers.map(o => `<tr><td>${esc(pretty(o.item) || ("any " + o.tag))}</td><td class="num">${fmt(o.price, 2)}</td>

@@ -79,10 +79,11 @@ class Market:
         load, used_slots, used_w, cost, revenue = [], 0, 0.0, 0.0, 0.0
         partial = {}  # item -> units already in a partially filled stack
         taken = {}    # buy offer -> units this load already sells to it (tag offers take several items)
+        used = {}     # item -> units of the seller's stock this load already takes (two offers can want one item)
         for name, so, bo, unit in cands:
             it = self.item(name)
             key = offer_key(Y, bo)
-            avail = so["quantity"] - st["sold"].get((X, name), 0)
+            avail = so["quantity"] - st["sold"].get((X, name), 0) - used.get(name, 0)
             want = bo["quantity"] - st["bought"].get(key, 0) - taken.get(key, 0)
             if bo["quantity"] == 999 and not bo["limit"]:
                 want = math.inf
@@ -103,6 +104,7 @@ class Market:
             cost += q * so["price"]
             revenue += q * bo["price"] * (1 + self.a.bonus)
             taken[key] = taken.get(key, 0) + q
+            used[name] = used.get(name, 0) + q
             load.append({"item": name, "qty": q, "buy": so["price"], "sell": bo["price"], "profit": round(q * unit, 2),
                          "offer": key, "viaTag": None if bo["item"] else bo.get("tag"), "unknownItem": bool(it.get("unknown"))})
         return load, used_slots, used_w, cost, revenue
