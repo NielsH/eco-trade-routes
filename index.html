@@ -159,7 +159,10 @@ let SHOPS = [], BYID = {}, ITEMS = {}, PLAYERS = [], RUNS = [], DEALS = [], M = 
 let LIVE_VEHICLES = null;   // /vehicles: placed vehicles with real cargo storage; null on servers without the route
 let start = store.get("start", null);   // null | {kind:"pos", x, z, label} | {kind:"shop", id} | {kind:"player", name}
 let tab = "runs", selected = null, hoverShop = null, picking = false, loadedAt = null;
-let DONE = { sold: {}, bought: {}, money: {} }, doneRuns = 0;   // trades of runs you continued from; cleared by Refresh
+// Trades of runs you finished ("Continue from"), kept until fresh data shows them: the server caches /shops for up to
+// 60 s, so a sale from seconds ago can still be missing. DONE is the part not visible yet, subtracted while planning.
+let TRADES = { sells: {}, buys: {}, money: {} }, DONE = { sold: {}, bought: {}, money: {} }, tradeCheck = null;
+const TRADE_TTL_MS = 3 * 60 * 1000;   // well past the server's 60 s cache: by then fresh data must include the trade
 const S = {};                            // settings, read from the form
 
 // ---------------- data ----------------
@@ -172,7 +175,6 @@ const norm = t => String(t || "").replace(/\s/g, "").toLowerCase();
 
 async function load() {
   $("status").textContent = "Loading shops, items and players…";
-  DONE = { sold: {}, bought: {}, money: {} }; doneRuns = 0;
   try {
     const [shops, items, players, vehicles] = await Promise.all([
       getJSON(API + "/shops"), getJSON(API + "/items"),
@@ -208,13 +210,63 @@ async function load() {
     BYID = Object.fromEntries(SHOPS.map(s => [s.id, s]));
     PLAYERS = players.Players;
     LIVE_VEHICLES = vehicles.Vehicles && vehicles.Vehicles.filter(v => !v.Error);
+    const previousData = loadedAt;
     loadedAt = shops.GeneratedAt;
     fillCurrencies(); fillPlayers(); fillVehicles();
+    tradeCheck = reconcile(previousData === loadedAt);
     replan();
   } catch (e) {
     $("status").innerHTML = `<span class="err">Could not load from ${esc(SERVER)}: ${esc(e.message)}</span>`;
     $("list").innerHTML = `<div class="status err">${esc(e.message)}</div>`;
   }
+}
+
+// ---------------- finished runs vs fresh data ----------------
+// Records a finished run's trades with the numbers the page had when it was planned (call before reloading).
+function recordTrades(r) {
+  const now = Date.now(), legs = [...r.legs, ...r.side];
+  for (const leg of legs) for (const l of leg.load) {
+    const so = BYID[leg.from].sells.find(o => o.item === l.item && o.quantity > 0 && o.price >= 0);   // the offer the planner used
+    const sk = leg.from + "|" + l.item;
+    TRADES.sells[sk] ||= { shop: leg.from, item: l.item, qty: 0, before: so ? so.quantity : 0, at: now };
+    TRADES.sells[sk].qty += l.qty;
+    const bo = BYID[leg.to].buys.find(o => o.key === l.offer);
+    if (bo && !(bo.quantity === 999 && !bo.limit)) {   // an offer without a limit has no demand to use up
+      TRADES.buys[l.offer] ||= { shop: leg.to, key: l.offer, item: bo.item, tag: bo.tag, qty: 0, before: bo.quantity, at: now };
+      TRADES.buys[l.offer].qty += l.qty;
+    }
+  }
+  for (const leg of legs) {
+    if (BYID[leg.to].balance === "infinite") continue;
+    TRADES.money[leg.to] ||= { shop: leg.to, amount: 0, before: BYID[leg.to].balance || 0, at: now };
+    TRADES.money[leg.to].amount += leg.revenue;
+  }
+}
+// After a reload: whatever the server already shows is taken as-is; only the rest stays in DONE. Trades fully visible, or
+// older than TRADE_TTL_MS, are forgotten. Approximate when other players trade at the same shops in between.
+function reconcile(sameData) {
+  const done = { sold: {}, bought: {}, money: {} }, now = Date.now();
+  let seen = 0, total = 0;
+  const unseen = (qty, before, after) => qty - Math.max(0, Math.min(qty, before - after));
+  for (const [k, x] of Object.entries(TRADES.sells)) {
+    const so = BYID[x.shop]?.sells.find(o => o.item === x.item && o.price >= 0);
+    const left = so ? unseen(x.qty, x.before, so.quantity) : 0;
+    total++; if (left <= 0) seen++;
+    if (left > 0 && now - x.at < TRADE_TTL_MS) done.sold[k] = left; else delete TRADES.sells[k];
+  }
+  for (const [k, x] of Object.entries(TRADES.buys)) {
+    const offers = BYID[x.shop]?.buys || [], bo = offers.find(o => o.key === k && o.item === x.item && o.tag === x.tag) || offers.find(o => o.item === x.item && o.tag === x.tag);
+    const left = bo ? unseen(x.qty, x.before, bo.quantity) : 0;   // offer gone: nothing left to subtract
+    total++; if (left <= 0) seen++;
+    if (left > 0 && now - x.at < TRADE_TTL_MS) done.bought[bo.key] = left; else delete TRADES.buys[k];
+  }
+  for (const [k, x] of Object.entries(TRADES.money)) {
+    const bal = BYID[x.shop]?.balance;
+    const left = bal == null || bal === "infinite" ? 0 : x.amount - Math.max(0, Math.min(x.amount, x.before - bal));
+    if (left > 0.01 && now - x.at < TRADE_TTL_MS) done.money[k] = left; else delete TRADES.money[k];
+  }
+  DONE = done;
+  return total ? { seen, total, sameData } : null;
 }
 
 // ---------------- planner (port of plan_routes.py) ----------------
@@ -530,7 +582,11 @@ function renderStart() {
   if (start?.kind === "pos") t = `<b>${esc(start.label || "map point")}</b>`;
   if (start?.kind === "player") t = sp ? `player <b>${esc(start.name)}</b>` : `player ${esc(start.name)} <span class="err">(not online)</span>`;
   if (sp) t += ` <span class="sub">x ${Math.round(sp.x)}, z ${Math.round(sp.z)}</span>`;
-  if (doneRuns) t += `<br><span class="sub">Assuming the ${doneRuns === 1 ? "run" : doneRuns + " runs"} you continued from happened · Refresh to reload real stock</span>`;
+  if (tradeCheck) {
+    const open = tradeCheck.total - tradeCheck.seen;
+    t += `<br><span class="sub">Data reloaded after your run: ${tradeCheck.seen} of ${tradeCheck.total} trades already visible on the server` +
+         (open ? `; ${open} still assumed${tradeCheck.sameData ? " (the server's 60 s shop cache hasn't caught up; Refresh in a minute to confirm)" : ""}` : "") + `</span>`;
+  }
   $("startText").innerHTML = t;
   if (start?.kind !== "player") $("player").value = "";
 }
@@ -733,11 +789,13 @@ function render() {
     if (selected?.kind === k && selected.i === i) return;
     selected = { kind: k, i }; render(); draw();
   });
-  list.querySelectorAll("[data-continue]").forEach(b => b.onclick = () => {
+  list.querySelectorAll("[data-continue]").forEach(b => b.onclick = async () => {
     const r = RUNS[+b.dataset.continue];
+    recordTrades(r);   // against the numbers this run was planned on, before they're replaced
     if (S.cash !== Infinity) { $("cash").value = Math.floor(S.cash + r.profit); saveForm(); }
-    DONE = r.st; doneRuns++;
-    setStart({ kind: "shop", id: r.path[r.path.length - 1] });
+    start = { kind: "shop", id: r.path[r.path.length - 1] }; store.set("start", start);
+    picking = false; updatePickUi();
+    loadMap(); await load();   // you just traded: plan the next run on fresh data
   });
   list.querySelectorAll("[data-start]").forEach(b => b.onclick = () => setStart({ kind: "shop", id: b.dataset.start }));
 }
