@@ -824,11 +824,11 @@ function draw() {
   ctx.clearRect(0, 0, r.width, r.height);
   ctx.imageSmoothingEnabled = (IMG.naturalWidth || 0) > 1000 * view.s;
   if (IMG.complete && IMG.naturalWidth) ctx.drawImage(IMG, view.ox, view.oy, 1000 * view.s, 1000 * view.s);
-  const hi = new Set(), sp = startPosition();
+  const hi = new Set(), sideStops = new Set(), sp = startPosition();
   if (selected?.kind === "run" && RUNS[selected.i]) {
     const run = RUNS[selected.i];
     if (sp) drawLeg(sp, BYID[run.path[0]].position, css("--start"), 2.5, "", true);
-    run.side.forEach(sd => arrow(BYID[sd.from].position, BYID[sd.to].position, css("--side"), 2.5, "", true));
+    run.side.forEach(sd => { sideStops.add(sd.from); sideStops.add(sd.to); });   // side-deal goods ride the run's own legs: mark where they're picked up and dropped off
     run.legs.forEach((leg, k) => drawLeg(BYID[leg.from].position, BYID[leg.to].position, css("--route"), 3.5, String(k + 1)));
     run.path.forEach(id => hi.add(id));
   } else if (selected?.kind === "deal" && DEALS[selected.i]) {
@@ -842,6 +842,7 @@ function draw() {
     ctx.beginPath(); ctx.arc(x, y, rad, 0, 7);
     ctx.fillStyle = s.on && s.enabled ? (h ? css("--accent") : css("--shop")) : css("--closed");
     ctx.fill(); ctx.lineWidth = 1.6; ctx.strokeStyle = css("--shop-ring"); ctx.stroke();
+    if (sideStops.has(s.id)) { ctx.beginPath(); ctx.arc(x, y, rad + 4, 0, 7); ctx.lineWidth = 2.5; ctx.strokeStyle = css("--side"); ctx.stroke(); }
     if (h || view.s > 2.2) label(s.name, x + rad + 4, y, h);
   }
   for (const p of PLAYERS || []) {
