@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trade Route Planner</title>
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --ink: #1d2126; --muted: #5d6670; --line: #e2e0d8; --hover: #f1efe8; --field: #fbfaf7;
+  --accent: #b5532a; --accent-soft: #f6e3d9; --good: #2f7d4f; --bad: #b42318; --shop: #ffffff; --shop-ring: #1d2126;
+  --closed: #9aa0a6; --route: #d9480f; --side: #7048e8; --start: #1c7ed6; --player: #e8590c; --map-bg: #6f6a5c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15181c; --panel: #1d2126; --ink: #e8e6e1; --muted: #9aa3ad; --line: #2e333a; --hover: #252a30; --field: #171a1e;
+    --accent: #f08c5a; --accent-soft: #3a2a22; --good: #6fcf97; --bad: #ff8787; --shop: #1d2126; --shop-ring: #f5f3ee;
+    --closed: #6b7178; --route: #ff8a4c; --side: #b197fc; --start: #4dabf7; --player: #ffa94d; --map-bg: #3a372f;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15181c; --panel: #1d2126; --ink: #e8e6e1; --muted: #9aa3ad; --line: #2e333a; --hover: #252a30; --field: #171a1e;
+  --accent: #f08c5a; --accent-soft: #3a2a22; --good: #6fcf97; --bad: #ff8787; --shop: #1d2126; --shop-ring: #f5f3ee;
+  --closed: #6b7178; --route: #ff8a4c; --side: #b197fc; --start: #4dabf7; --player: #ffa94d; --map-bg: #3a372f;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.app { display: grid; grid-template-columns: 400px 1fr; height: 100vh; }
+aside { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+header { padding: 12px 14px 8px; border-bottom: 1px solid var(--line); }
+h1 { font-size: 16px; margin: 0; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.sub { color: var(--muted); font-size: 12px; }
+button { font: inherit; color: var(--ink); background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; cursor: pointer; }
+button:hover { background: var(--hover); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.on { background: var(--start); border-color: var(--start); color: #fff; }
+input, select { font: inherit; color: var(--ink); background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; min-width: 0; }
+.box { padding: 8px 14px; border-bottom: 1px solid var(--line); }
+.row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.row + .row { margin-top: 6px; }
+.lbl { color: var(--muted); font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 6px; }
+.grid label { display: flex; flex-direction: column; font-size: 11px; color: var(--muted); gap: 2px; }
+.grid input, .grid select { width: 100%; }
+details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.startinfo { font-size: 13px; }
+.startinfo b { color: var(--start); }
+.tabs { display: flex; gap: 4px; padding: 8px 12px 0; }
+.tabs button { flex: 1; border-radius: 6px 6px 0 0; border-bottom: none; color: var(--muted); }
+.tabs button[aria-selected="true"] { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
+.filter { padding: 6px 12px; border-top: 1px solid var(--line); }
+.filter input { width: 100%; }
+.list { overflow-y: auto; flex: 1; min-height: 0; }
+.item { padding: 9px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.item:hover { background: var(--hover); }
+.item.sel { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); cursor: default; }
+.item .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.big { font-weight: 600; font-variant-numeric: tabular-nums; }
+.rate { color: var(--good); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.path { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.legs { margin: 6px 0 4px; padding: 0; list-style: none; font-size: 12px; }
+.legs li { padding: 3px 0 3px 22px; position: relative; }
+.legs li .n { position: absolute; left: 0; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--route); color: #fff; font-size: 10px; display: grid; place-items: center; font-weight: 700; }
+.legs li.side .n { background: var(--side); }
+.legs li.lead .n { background: var(--start); }
+.goods { color: var(--muted); }
+main { position: relative; min-width: 0; min-height: 0; background: var(--map-bg); overflow: hidden; }
+canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+canvas.drag { cursor: grabbing; }
+canvas.pick { cursor: crosshair; }
+.tip { position: absolute; pointer-events: none; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 12px; max-width: 320px; box-shadow: 0 4px 16px rgba(0,0,0,.2); display: none; }
+.coords { position: absolute; left: 10px; bottom: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.controls { position: absolute; right: 10px; top: 10px; display: flex; gap: 6px; }
+.banner { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); background: var(--start); color: #fff; border-radius: 6px; padding: 5px 12px; font-size: 13px; display: none; }
+.detail { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.detail h2 { font-size: 15px; margin: 0 0 2px; }
+table.offers { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.offers th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); padding: 3px 4px; }
+.offers td { padding: 3px 4px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.offers .num { text-align: right; }
+.empty, .status { color: var(--muted); padding: 14px; }
+.err { color: var(--bad); }
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: 50vh 50vh; }
+  main { order: -1; }
+  aside { border-right: none; border-top: 1px solid var(--line); }
+  .grid { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <header>
+      <h1>Trade routes <span class="row"><button id="refresh" title="Reload shops, players and map">Refresh</button><button id="theme" title="Light/dark">◐</button></span></h1>
+      <div class="sub" id="status">Loading…</div>
+    </header>
+    <div class="box">
+      <div class="row startinfo"><span class="lbl">Start:</span> <span id="startText">anywhere</span></div>
+      <div class="row">
+        <button id="pick">Pick on map</button>
+        <select id="player" title="Start from an online player's position"><option value="">Player…</option></select>
+        <button id="clearStart">Anywhere</button>
+      </div>
+      <details id="settingsBox">
+        <summary>Vehicle, cash and planning settings</summary>
+        <div class="grid">
+          <label style="grid-column: span 2">Vehicle<select id="vehicle"></select></label>
+          <label>Slots<input id="slots" type="number" min="1"></label>
+          <label>Max kg<input id="maxkg" type="number" min="1"></label>
+          <label>Speed<input id="speed" type="number" min="1" step="0.5"></label>
+          <label>Cash (blank = ∞)<input id="cash" type="number" min="0" placeholder="∞"></label>
+          <label>Max legs<input id="legs" type="number" min="1" max="8"></label>
+          <label>Min legs<input id="minLegs" type="number" min="1" max="8"></label>
+          <label style="grid-column: span 2">Currency<select id="currency"></select></label>
+          <label>Stop min<input id="stopMin" type="number" min="0" step="0.5"></label>
+          <label>Road factor<input id="routeFactor" type="number" min="1" step="0.1"></label>
+          <label>Bonus %<input id="bonus" type="number" min="0" step="1"></label>
+          <label>Wrap edges<select id="wrap"><option value="0">no (land)</option><option value="1">yes (boats)</option></select></label>
+        </div>
+      </details>
+    </div>
+    <div class="tabs" role="tablist">
+      <button role="tab" data-tab="runs" aria-selected="true">Runs</button>
+      <button role="tab" data-tab="deals" aria-selected="false">Direct deals</button>
+      <button role="tab" data-tab="shops" aria-selected="false">Shops</button>
+    </div>
+    <div class="filter"><input id="q" type="search" placeholder="Filter by item or shop"></div>
+    <div class="list" id="list"><div class="status">Loading…</div></div>
+  </aside>
+  <main>
+    <canvas id="map"></canvas>
+    <div class="banner" id="banner">Click the map to set your start</div>
+    <div class="tip" id="tip"></div>
+    <div class="coords" id="coords">x –, z –</div>
+    <div class="controls"><button id="fit">Reset view</button></div>
+  </main>
+</div>
+<script src="vehicles.js"></script>
+<script>
+"use strict";
+//vehicles.js (tools/build_catalog.py) defines window.VEHICLES; the fallback keeps the page usable without it.
+const VEHICLES = window.VEHICLES || { PoweredCart: { slots: 18, maxWeightKg: 3500, speed: 12, water: false } };
+const params = new URLSearchParams(location.search);
+const SERVER = (params.get("server") || "https://play.factoreco.org").replace(/\/$/, "");
+const API = SERVER + "/api/v1/plugins/RecipeApi";
+const W = 2000;
+const $ = id => document.getElementById(id);
+const fmt = (n, d = 1) => Number(n).toLocaleString(undefined, { maximumFractionDigits: d });
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const clean = s => String(s ?? "").replace(/<[^>]+>/g, "").trim() || "(unnamed)";
+const pretty = n => String(n ?? "").replace(/Item$/, "").replace(/([a-z])([A-Z])/g, "$1 $2");
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const store = { get(k, d) { try { const v = localStorage.getItem("trade." + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+                set(k, v) { try { localStorage.setItem("trade." + k, JSON.stringify(v)); } catch (e) {} } };
+
+// ---------------- state ----------------
+let SHOPS = [], BYID = {}, ITEMS = {}, PLAYERS = [], RUNS = [], DEALS = [], M = null;
+let start = store.get("start", null);   // null | {kind:"pos", x, z, label} | {kind:"shop", id} | {kind:"player", name}
+let tab = "runs", selected = null, hoverShop = null, picking = false, loadedAt = null;
+let DONE = { sold: {}, bought: {}, money: {} }, doneRuns = 0;   // trades of runs you continued from; cleared by Refresh
+const S = {};                            // settings, read from the form
+
+// ---------------- data ----------------
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(`${url.replace(SERVER, "")} → HTTP ${r.status}`);
+  return r.json();
+}
+const norm = t => String(t || "").replace(/\s/g, "").toLowerCase();
+
+async function load() {
+  $("status").textContent = "Loading shops, items and players…";
+  DONE = { sold: {}, bought: {}, money: {} }; doneRuns = 0;
+  try {
+    const [shops, items, players] = await Promise.all([
+      getJSON(API + "/shops"), getJSON(API + "/items"),
+      getJSON(API + "/players").catch(() => ({ Players: null })),   // older RecipeApi without /players
+    ]);
+    ITEMS = {};
+    for (const i of items.Items) ITEMS[i.Item] = { weightKg: i.Weight / 1000, stackSize: i.MaxStackSize, carried: i.Carried, name: i.Name, tags: i.Tags };
+    // Tag -> items. Exact from /items Tags; older servers: /tags (display names), matched loosely.
+    const tagIndex = {};
+    if (items.Items.length && items.Items[0].Tags) {
+      for (const i of items.Items) for (const t of i.Tags) (tagIndex[norm(t)] ||= []).push(i.Item);
+    } else {
+      const byName = Object.fromEntries(items.Items.map(i => [i.Name, i.Item]));
+      let tags = null;
+      for (const u of ["/tags?all=true", "/tags"]) { try { tags = (await getJSON(API + u)).Tags; break; } catch (e) {} }
+      for (const [t, names] of Object.entries(tags || {})) tagIndex[norm(t)] = names.map(n => byName[n]).filter(Boolean);
+    }
+    SHOPS = shops.Shops.filter(s => !s.Error).map(s => ({
+      id: s.Id, name: clean(s.Name), owner: s.Owner, x: s.Position.X, z: s.Position.Z, position: { x: s.Position.X, z: s.Position.Z },
+      on: s.On, enabled: s.Enabled, currency: s.Currency, balance: s.UnlimitedBalance ? "infinite" : s.Balance, emptySlots: s.EmptySlots,
+      sells: s.Sells.map((o, n) => ({ key: `${s.Id}/s${n}`, item: o.Item, tag: o.Tag, price: o.Price, quantity: o.Available, limit: o.Limit })),
+      buys: s.Buys.map((o, n) => ({
+        key: `${s.Id}/b${n}`, item: o.Item, tag: o.Tag, price: o.Price, limit: o.Limit,
+        tagItems: o.Item ? null : (tagIndex[norm(o.Tag)] || []),
+        quantity: o.CanAccept ?? 999, unlimited: o.Wanted == null, wanted: o.Wanted, canAfford: o.CanAfford, canStore: o.CanStore,
+      })),
+    }));
+    BYID = Object.fromEntries(SHOPS.map(s => [s.id, s]));
+    PLAYERS = players.Players;
+    loadedAt = shops.GeneratedAt;
+    fillCurrencies(); fillPlayers();
+    replan();
+  } catch (e) {
+    $("status").innerHTML = `<span class="err">Could not load from ${esc(SERVER)}: ${esc(e.message)}</span>`;
+    $("list").innerHTML = `<div class="status err">${esc(e.message)}</div>`;
+  }
+}
+
+// ---------------- planner (port of plan_routes.py) ----------------
+function dist(a, b) {
+  let dx = Math.abs(a.x - b.x), dz = Math.abs(a.z - b.z);
+  if (S.wrap) { dx = Math.min(dx, W - dx); dz = Math.min(dz, W - dz); }
+  return Math.hypot(dx, dz);
+}
+const minutes = (a, b) => dist(a, b) * S.routeFactor / S.speed / 60;
+const itemInfo = name => ITEMS[name] || { weightKg: 0, stackSize: 100, carried: false, unknown: true };
+const mod = (a, n) => ((a % n) + n) % n;
+
+function buildMarket() {
+  const open = SHOPS.filter(s => s.on && s.enabled && s.currency && s.currency === S.currency);
+  const byId = Object.fromEntries(open.map(s => [s.id, s]));
+  const sells = {};
+  for (const s of open) { sells[s.id] = {}; for (const o of s.sells) if (o.item && o.quantity > 0 && o.price >= 0 && !(o.item in sells[s.id])) sells[s.id][o.item] = o; }
+  const pairs = new Map(), out = {};
+  for (const X of open) for (const Y of open) {
+    if (X === Y) continue;
+    const m = [];
+    for (const bo of Y.buys) {
+      if (bo.quantity <= 0) continue;
+      for (const name of bo.item ? [bo.item] : (bo.tagItems || [])) {   // a tag offer takes any item in its tag, sharing one limit
+        const so = sells[X.id][name];
+        if (!so) continue;
+        const unit = bo.price * (1 + S.bonus) - so.price;
+        if (unit > 0) m.push({ name, so, bo, unit });
+      }
+    }
+    if (m.length) { pairs.set(X.id + "|" + Y.id, m); (out[X.id] ||= []).push(Y.id); }
+  }
+  return { open, byId, pairs, out };
+}
+
+function fill(X, Y, st, slotsLeft, weightLeft, cash) {
+  const cands = [...(M.pairs.get(X + "|" + Y) || [])];
+  const dens = c => { const it = itemInfo(c.name); return c.unit / Math.max(1 / it.stackSize / S.slots, it.weightKg / S.maxWeightKg); };
+  cands.sort((a, b) => dens(b) - dens(a));
+  const Ys = M.byId[Y];
+  const yMoney = Ys.balance === "infinite" ? Infinity : (Ys.balance || 0) - (st.money[Y] || 0);
+  const load = [], partial = {}, taken = {};
+  let usedSlots = 0, usedW = 0, cost = 0, revenue = 0;
+  for (const { name, so, bo, unit } of cands) {
+    const it = itemInfo(name);
+    const avail = so.quantity - (st.sold[X + "|" + name] || 0);
+    let want = bo.quantity - (st.bought[bo.key] || 0) - (taken[bo.key] || 0);
+    if (bo.quantity === 999 && !bo.limit) want = Infinity;
+    let q = Math.min(avail, want);
+    if (q <= 0) continue;
+    const roomSlots = (slotsLeft - usedSlots) * it.stackSize + (partial[name] || 0);
+    const roomW = it.weightKg > 0 ? Math.floor((weightLeft - usedW) / it.weightKg) : Infinity;
+    const afford = so.price > 0 ? Math.floor((cash - cost) / so.price) : Infinity;
+    const payable = bo.price > 0 ? Math.floor((yMoney - revenue) / bo.price) : Infinity;
+    q = Math.floor(Math.min(q, roomSlots, roomW, afford, payable));
+    if (!(q > 0)) continue;
+    const newTotal = q - (partial[name] || 0);
+    usedSlots += Math.max(0, Math.ceil(newTotal / it.stackSize));
+    partial[name] = mod(-newTotal, it.stackSize);
+    usedW += q * it.weightKg; cost += q * so.price; revenue += q * bo.price * (1 + S.bonus);
+    taken[bo.key] = (taken[bo.key] || 0) + q;
+    load.push({ item: name, qty: q, buy: so.price, sell: bo.price, profit: q * unit, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown });
+  }
+  return { load, slots: usedSlots, w: usedW, cost, revenue };
+}
+
+function apply(st, X, Y, load, revenue) {
+  const n = { sold: { ...st.sold }, bought: { ...st.bought }, money: { ...st.money } };
+  for (const l of load) { n.sold[X + "|" + l.item] = (n.sold[X + "|" + l.item] || 0) + l.qty; n.bought[l.offer] = (n.bought[l.offer] || 0) + l.qty; }
+  n.money[Y] = (n.money[Y] || 0) + revenue;
+  return n;
+}
+
+function plan(startPos) {
+  const seeds = Object.keys(M.out);
+  let beam = seeds.map(s => {
+    const lead = startPos ? minutes(startPos, M.byId[s].position) : 0;
+    return { path: [s], legs: [], lead, profit: 0, minutes: lead + S.stopMinutes, cash: S.cash, st: DONE };
+  });
+  const results = [];
+  for (let d = 0; d < S.legs; d++) {
+    const next = [];
+    for (const b of beam) {
+      const X = b.path[b.path.length - 1];
+      for (const Y of M.out[X] || []) {
+        const f = fill(X, Y, b.st, S.slots, S.maxWeightKg, b.cash);
+        if (!f.load.length) continue;
+        const mins = minutes(M.byId[X].position, M.byId[Y].position) + S.stopMinutes;
+        next.push({ path: [...b.path, Y], lead: b.lead,
+          legs: [...b.legs, { from: X, to: Y, load: f.load, slots: f.slots, w: f.w, cost: f.cost, revenue: f.revenue, minutes: mins }],
+          profit: b.profit + f.revenue - f.cost, minutes: b.minutes + mins, cash: b.cash - f.cost + f.revenue, st: apply(b.st, X, Y, f.load, f.revenue) });
+      }
+    }
+    next.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
+    const seen = new Set(); beam = [];
+    for (const n of next) {
+      const k = n.path[n.path.length - 1] + "|" + [...new Set(n.path)].sort().join(",");
+      if (seen.has(k)) continue;
+      seen.add(k); beam.push(n);
+      if (beam.length >= 300) break;
+    }
+    results.push(...beam);
+    if (!beam.length) break;
+  }
+  return results;
+}
+
+function sideDeals(run) {
+  const path = run.path, legs = run.legs = run.legs.map(l => ({ ...l }));   // runs share leg objects with their beam ancestors
+  let st = run.st;
+  const cashAt = []; let c = S.cash;
+  for (const leg of legs) { c -= leg.cost; cashAt.push(c); c += leg.revenue; }
+  const side = []; let extra = 0;
+  for (let i = 0; i < path.length; i++) for (let j = i + 2; j < path.length; j++) {
+    let freeSlots = Infinity, freeW = Infinity, cash = Infinity;
+    for (let k = i; k < j; k++) { freeSlots = Math.min(freeSlots, S.slots - legs[k].slots); freeW = Math.min(freeW, S.maxWeightKg - legs[k].w); cash = Math.min(cash, cashAt[k]); }
+    if (freeSlots <= 0 || freeW <= 0) continue;
+    const f = fill(path[i], path[j], st, freeSlots, freeW, cash);
+    if (!f.load.length) continue;
+    for (let k = i; k < j; k++) { legs[k].slots += f.slots; legs[k].w += f.w; cashAt[k] -= f.cost; }
+    st = apply(st, path[i], path[j], f.load, f.revenue);
+    side.push({ from: path[i], to: path[j], fromStop: i, toStop: j, load: f.load, cost: f.cost, revenue: f.revenue });
+    extra += f.revenue - f.cost;
+  }
+  run.side = side; run.profit += extra; run.st = st;
+  return run;
+}
+
+function directDeals(startPos) {
+  const deals = [];
+  for (const [k, cands] of M.pairs) {
+    const [X, Y] = k.split("|"), A = M.byId[X], B = M.byId[Y];
+    const lead = startPos ? minutes(startPos, A.position) : 0, leg = minutes(A.position, B.position) + S.stopMinutes;
+    for (const { name, so, bo, unit } of cands) {
+      const it = itemInfo(name);
+      const cap = Math.min(S.slots * it.stackSize, it.weightKg > 0 ? Math.floor(S.maxWeightKg / it.weightKg) : Infinity);
+      const limits = { "A stock": so.quantity - (DONE.sold[X + "|" + name] || 0),
+        "B wants": bo.quantity === 999 && !bo.limit ? Infinity : bo.quantity - (DONE.bought[bo.key] || 0),
+        "B money": B.balance === "infinite" ? Infinity : Math.floor(((B.balance || 0) - (DONE.money[Y] || 0)) / bo.price),
+        "your cash": so.price > 0 ? Math.floor(S.cash / so.price) : Infinity, "vehicle": cap };
+      const q = Math.min(...Object.values(limits));
+      if (!(q > 0)) continue;
+      const mins = lead + S.stopMinutes + leg;
+      deals.push({ X, Y, name, q, unit, profit: q * unit, mins, rate: q * unit / mins, viaTag: bo.item ? null : bo.tag,
+        buy: so.price, sell: bo.price, limitedBy: Object.keys(limits).find(k => limits[k] === q), lead });
+    }
+  }
+  return deals.sort((a, b) => b.rate - a.rate).slice(0, 200);
+}
+
+function startPosition() {
+  if (!start) return null;
+  if (start.kind === "pos") return { x: start.x, z: start.z };
+  if (start.kind === "shop") return BYID[start.id] ? BYID[start.id].position : null;
+  if (start.kind === "player") { const p = (PLAYERS || []).find(p => p.Name === start.name); return p ? { x: p.Position.X, z: p.Position.Z } : null; }
+  return null;
+}
+
+let replanTimer = null;
+function replan() { clearTimeout(replanTimer); replanTimer = setTimeout(doReplan, 30); }
+function doReplan() {
+  readSettings();
+  const t0 = performance.now();
+  M = buildMarket();
+  const sp = startPosition();
+  const runs = plan(sp).filter(r => r.legs.length >= S.minLegs);
+  runs.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
+  const seen = new Set(); RUNS = [];
+  for (const r of runs) { const k = r.path.join(">"); if (seen.has(k)) continue; seen.add(k); RUNS.push(sideDeals(r)); if (RUNS.length >= 40) break; }
+  RUNS.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
+  DEALS = directDeals(sp);
+  if (selected && selected.kind !== "shop") selected = RUNS.length ? { kind: "run", i: 0 } : null;
+  if (!selected && RUNS.length) selected = { kind: "run", i: 0 };
+  const ms = performance.now() - t0;
+  $("status").textContent = `${M.open.length} open ${S.currency} shops · ${M.pairs.size} profitable pairs · planned in ${fmt(ms, 0)} ms · data ${loadedAt ? new Date(loadedAt).toLocaleTimeString() : "?"}`;
+  renderStart(); render(); draw();
+}
+
+// ---------------- settings ----------------
+const FIELDS = { vehicle: "PoweredCart", slots: "", maxkg: "", speed: "", cash: "", legs: 4, minLegs: 1, currency: "", stopMin: 1, routeFactor: 1.3, bonus: 0, wrap: "0" };
+function initForm() {
+  $("vehicle").innerHTML = Object.entries(VEHICLES).map(([k, v]) => `<option value="${k}">${pretty(k)}${v.water ? " (water)" : ""}${v.slots ? "" : " (set slots)"}</option>`).join("");
+  for (const [id, d] of Object.entries(FIELDS)) $(id).value = store.get("f." + id, d);
+  if (!$("vehicle").value) $("vehicle").value = "PoweredCart";
+  if (!$("slots").value) vehicleDefaults();
+  $("vehicle").addEventListener("change", () => { vehicleDefaults(); saveForm(); replan(); });
+  for (const id of Object.keys(FIELDS)) if (id !== "vehicle") $(id).addEventListener("change", () => { saveForm(); replan(); });
+}
+function vehicleDefaults() {
+  const v = VEHICLES[$("vehicle").value] || {};
+  $("slots").value = v.slots ?? ""; $("maxkg").value = v.maxWeightKg ?? ""; $("speed").value = v.speed ?? "";
+  $("wrap").value = v.water ? "1" : "0";
+  if (!v.slots) $("settingsBox").open = true;
+}
+function saveForm() { for (const id of Object.keys(FIELDS)) store.set("f." + id, $(id).value); }
+function readSettings() {
+  const num = (id, d) => { const v = parseFloat($(id).value); return isFinite(v) ? v : d; };
+  Object.assign(S, {
+    slots: Math.max(1, num("slots", 18)), maxWeightKg: Math.max(1, num("maxkg", 3500)), speed: Math.max(0.5, num("speed", 12)),
+    cash: $("cash").value === "" ? Infinity : Math.max(0, num("cash", 0)),
+    legs: Math.min(8, Math.max(1, num("legs", 4))), minLegs: Math.max(1, num("minLegs", 1)),
+    currency: $("currency").value, stopMinutes: Math.max(0, num("stopMin", 1)), routeFactor: Math.max(1, num("routeFactor", 1.3)),
+    bonus: Math.max(0, num("bonus", 0)) / 100, wrap: $("wrap").value === "1",
+  });
+}
+function fillCurrencies() {
+  const counts = {};
+  for (const s of SHOPS) if (s.on && s.enabled && s.currency) counts[s.currency] = (counts[s.currency] || 0) + 1;
+  const list = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const keep = $("currency").value || store.get("f.currency", "");
+  $("currency").innerHTML = list.map(([c, n]) => `<option value="${esc(c)}">${esc(c)} (${n})</option>`).join("");
+  $("currency").value = counts[keep] ? keep : (list[0] || [""])[0];
+}
+function fillPlayers() {
+  const sel = $("player"), keep = start?.kind === "player" ? start.name : store.get("me", "");
+  if (PLAYERS == null) { sel.innerHTML = `<option value="">Players: needs RecipeApi /players</option>`; sel.disabled = true; return; }
+  sel.disabled = false;
+  sel.innerHTML = `<option value="">Player… (${PLAYERS.length} online)</option>` + PLAYERS.map(p => `<option>${esc(p.Name)}</option>`).join("");
+  if (keep && PLAYERS.some(p => p.Name === keep)) sel.value = keep;
+}
+
+// ---------------- start ----------------
+function setStart(s) { start = s; store.set("start", s); if (s?.kind === "player") store.set("me", s.name); picking = false; updatePickUi(); replan(); }
+function renderStart() {
+  const sp = startPosition();
+  let t = "anywhere (runs begin at their first shop)";
+  if (start?.kind === "shop") t = `shop <b>${esc(BYID[start.id]?.name || "?")}</b>`;
+  if (start?.kind === "pos") t = `<b>${esc(start.label || "map point")}</b>`;
+  if (start?.kind === "player") t = sp ? `player <b>${esc(start.name)}</b>` : `player ${esc(start.name)} <span class="err">(not online)</span>`;
+  if (sp) t += ` <span class="sub">x ${Math.round(sp.x)}, z ${Math.round(sp.z)}</span>`;
+  if (doneRuns) t += `<br><span class="sub">Assuming the ${doneRuns === 1 ? "run" : doneRuns + " runs"} you continued from happened · Refresh to reload real stock</span>`;
+  $("startText").innerHTML = t;
+  if (start?.kind !== "player") $("player").value = "";
+}
+function updatePickUi() { $("pick").classList.toggle("on", picking); $("banner").style.display = picking ? "block" : "none"; cv.classList.toggle("pick", picking); }
+$("pick").onclick = () => { picking = !picking; updatePickUi(); };
+$("clearStart").onclick = () => setStart(null);
+$("player").onchange = e => e.target.value ? setStart({ kind: "player", name: e.target.value }) : setStart(null);
+$("refresh").onclick = load;
+
+// ---------------- map ----------------
+const IMG = new Image(); IMG.crossOrigin = "anonymous";
+IMG.onload = () => draw();
+function loadMap() { IMG.src = SERVER + "/Layers/TerrainLatest.gif?t=" + Date.now(); }
+const cv = $("map"), ctx = cv.getContext("2d");
+let view = { s: 0, ox: 0, oy: 0 };
+function resize() {
+  const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!view.s && r.width && r.height) return fit();
+  draw();
+}
+function fit() { const r = cv.getBoundingClientRect(), s = Math.min(r.width, r.height) / 1000; if (!s) return; view = { s, ox: (r.width - 1000 * s) / 2, oy: (r.height - 1000 * s) / 2 }; draw(); }
+const toScreen = (x, z) => [x / W * 1000 * view.s + view.ox, (W - z) / W * 1000 * view.s + view.oy];   //north up
+const toWorld = (sx, sy) => [((sx - view.ox) / view.s) / 1000 * W, W - ((sy - view.oy) / view.s) / 1000 * W];
+const wrapDelta = d => !S.wrap ? d : d > W / 2 ? d - W : d < -W / 2 ? d + W : d;
+
+function arrow(a, b, color, width, label, dashed) {
+  const dx = wrapDelta(b.x - a.x), dz = wrapDelta(b.z - a.z);
+  const copies = S.wrap ? [[a.x, a.z], [b.x - dx, b.z - dz]] : [[a.x, a.z]];
+  for (const [sx, sz] of copies) {
+    const [x1, y1] = toScreen(sx, sz), [x2, y2] = toScreen(sx + dx, sz + dz);
+    ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width; ctx.lineCap = "round";
+    if (dashed) ctx.setLineDash([6, 5]);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); ctx.setLineDash([]);
+    const ang = Math.atan2(y2 - y1, x2 - x1), len = Math.hypot(x2 - x1, y2 - y1), h = 7 + width;
+    if (len > 30) {
+      const hx = x1 + (x2 - x1) * 0.62, hy = y1 + (y2 - y1) * 0.62;
+      ctx.beginPath(); ctx.moveTo(hx + Math.cos(ang) * h, hy + Math.sin(ang) * h);
+      ctx.lineTo(hx + Math.cos(ang + 2.5) * h, hy + Math.sin(ang + 2.5) * h); ctx.lineTo(hx + Math.cos(ang - 2.5) * h, hy + Math.sin(ang - 2.5) * h);
+      ctx.closePath(); ctx.fill();
+    }
+    if (label && len > 24) {
+      const mx = x1 + (x2 - x1) * 0.4, my = y1 + (y2 - y1) * 0.4;
+      ctx.beginPath(); ctx.arc(mx, my, 9, 0, 7); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 10px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(label, mx, my + 0.5);
+    }
+    ctx.restore();
+  }
+}
+function label(text, x, y, bold) {
+  ctx.font = `${bold ? "600 " : ""}12px system-ui`; ctx.textBaseline = "middle"; ctx.textAlign = "left"; ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(0,0,0,.6)"; ctx.strokeText(text, x, y); ctx.fillStyle = "#fff"; ctx.fillText(text, x, y);
+}
+function draw() {
+  if (!view.s) return;
+  const r = cv.getBoundingClientRect();
+  ctx.clearRect(0, 0, r.width, r.height);
+  ctx.imageSmoothingEnabled = (IMG.naturalWidth || 0) > 1000 * view.s;
+  if (IMG.complete && IMG.naturalWidth) ctx.drawImage(IMG, view.ox, view.oy, 1000 * view.s, 1000 * view.s);
+  const hi = new Set(), sp = startPosition();
+  if (selected?.kind === "run" && RUNS[selected.i]) {
+    const run = RUNS[selected.i];
+    if (sp) arrow(sp, BYID[run.path[0]].position, css("--start"), 2.5, "", true);
+    run.side.forEach(sd => arrow(BYID[sd.from].position, BYID[sd.to].position, css("--side"), 2.5, "", true));
+    run.legs.forEach((leg, k) => arrow(BYID[leg.from].position, BYID[leg.to].position, css("--route"), 3.5, String(k + 1)));
+    run.path.forEach(id => hi.add(id));
+  } else if (selected?.kind === "deal" && DEALS[selected.i]) {
+    const d = DEALS[selected.i];
+    if (sp) arrow(sp, BYID[d.X].position, css("--start"), 2.5, "", true);
+    arrow(BYID[d.X].position, BYID[d.Y].position, css("--route"), 3.5, "");
+    hi.add(d.X); hi.add(d.Y);
+  } else if (selected?.kind === "shop") hi.add(selected.id);
+  for (const s of SHOPS) {
+    const [x, y] = toScreen(s.x, s.z), h = hi.has(s.id) || hoverShop === s, rad = h ? 7 : 4.5;
+    ctx.beginPath(); ctx.arc(x, y, rad, 0, 7);
+    ctx.fillStyle = s.on && s.enabled ? (h ? css("--accent") : css("--shop")) : css("--closed");
+    ctx.fill(); ctx.lineWidth = 1.6; ctx.strokeStyle = css("--shop-ring"); ctx.stroke();
+    if (h || view.s > 2.2) label(s.name, x + rad + 4, y, h);
+  }
+  for (const p of PLAYERS || []) {
+    const [x, y] = toScreen(p.Position.X, p.Position.Z), me = start?.kind === "player" && start.name === p.Name;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(Math.PI / 4); ctx.fillStyle = css("--player"); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+    const k = me ? 7 : 4.5; ctx.fillRect(-k, -k, 2 * k, 2 * k); ctx.strokeRect(-k, -k, 2 * k, 2 * k); ctx.restore();
+    if (me || view.s > 1.6) label(p.Name, x + 9, y, me);
+  }
+  if (sp) {
+    const [x, y] = toScreen(sp.x, sp.z);
+    ctx.beginPath(); ctx.arc(x, y, 10, 0, 7); ctx.lineWidth = 3; ctx.strokeStyle = css("--start"); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 3, 0, 7); ctx.fillStyle = css("--start"); ctx.fill();
+  }
+}
+
+let drag = null;
+cv.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, ox: view.ox, oy: view.oy, moved: false }; cv.setPointerCapture(e.pointerId); cv.classList.add("drag"); });
+cv.addEventListener("pointermove", e => {
+  const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (drag) {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    if (drag.moved) { view.ox = drag.ox + dx; view.oy = drag.oy + dy; draw(); }
+    return;
+  }
+  const [wx, wz] = toWorld(mx, my);
+  $("coords").textContent = `x ${Math.round(mod(wx, W))}, z ${Math.round(mod(wz, W))}`;
+  let best = null, bd = 12;
+  for (const s of SHOPS) { const [x, y] = toScreen(s.x, s.z), d = Math.hypot(x - mx, y - my); if (d < bd) { bd = d; best = s; } }
+  if (best !== hoverShop) { hoverShop = best; draw(); }
+  const tip = $("tip");
+  if (best && !picking) {
+    tip.style.display = "block";
+    tip.innerHTML = `<b>${esc(best.name)}</b><br>${esc(best.owner)} · ${best.on && best.enabled ? "open" : "closed"} · ${esc(best.currency || "barter")}` +
+      `<br>money ${best.balance === "infinite" ? "∞" : fmt(best.balance ?? 0)} · sells ${best.sells.length} · buys ${best.buys.length}`;
+    tip.style.left = Math.min(mx + 14, r.width - tip.offsetWidth - 8) + "px"; tip.style.top = Math.min(my + 14, r.height - tip.offsetHeight - 8) + "px";
+  } else tip.style.display = "none";
+});
+cv.addEventListener("pointerup", e => {
+  cv.classList.remove("drag");
+  const moved = drag?.moved; drag = null;
+  if (moved) return;
+  const r = cv.getBoundingClientRect(), [wx, wz] = toWorld(e.clientX - r.left, e.clientY - r.top);
+  if (picking) {
+    if (hoverShop) setStart({ kind: "shop", id: hoverShop.id });
+    else setStart({ kind: "pos", x: Math.round(mod(wx, W)), z: Math.round(mod(wz, W)), label: "map point" });
+    return;
+  }
+  if (hoverShop) showShop(hoverShop.id);
+});
+cv.addEventListener("pointerleave", () => { $("tip").style.display = "none"; hoverShop = null; draw(); });
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const ns = Math.min(Math.max(view.s * Math.exp(-e.deltaY * 0.0015), 0.3), 16);
+  view.ox = mx - (mx - view.ox) * ns / view.s; view.oy = my - (my - view.oy) * ns / view.s; view.s = ns; draw();
+}, { passive: false });
+$("fit").onclick = fit;
+$("theme").onclick = () => {
+  const cur = document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  document.documentElement.dataset.theme = cur === "dark" ? "light" : "dark"; store.set("theme", document.documentElement.dataset.theme); draw();
+};
+{ const t = store.get("theme", null); if (t) document.documentElement.dataset.theme = t; }
+
+// ---------------- side panel ----------------
+function selectTab(t) { tab = t; document.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.tab === t)); render(); }
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => selectTab(b.dataset.tab));
+$("q").addEventListener("input", render);
+const goods = load => load.map(l => `${fmt(l.qty, 0)} ${esc(pretty(l.item))}${l.viaTag ? ` (as ${esc(l.viaTag)})` : ""}${l.unknown ? " ⚠" : ""}`).join(", ");
+const shopName = id => esc(BYID[id]?.name || "?");
+
+function render() {
+  const q = $("q").value.trim().toLowerCase(), list = $("list");
+  let html = "";
+  if (!SHOPS.length) { list.innerHTML = `<div class="status">Loading…</div>`; return; }
+  if (tab === "runs") {
+    RUNS.forEach((r, i) => {
+      const text = (r.path.map(id => BYID[id].name).join(" ") + " " + [...r.legs, ...r.side].flatMap(l => l.load.map(x => pretty(x.item) + " " + (x.viaTag || ""))).join(" ")).toLowerCase();
+      if (q && !text.includes(q)) return;
+      const sel = selected?.kind === "run" && selected.i === i;
+      html += `<div class="item${sel ? " sel" : ""}" data-kind="run" data-i="${i}">
+        <div class="top"><span class="big">+${fmt(r.profit)} ${esc(S.currency)}</span><span class="rate">${fmt(r.profit / r.minutes)}/min · ${fmt(r.minutes)} min</span></div>
+        <div class="path">${r.path.map(shopName).join(" → ")}</div>`;
+      if (sel) {
+        html += `<ol class="legs">`;
+        if (r.lead > 0.05) html += `<li class="lead"><span class="n">↗</span>Drive from your start to ${shopName(r.path[0])} · ${fmt(r.lead)} min</li>`;
+        html += r.legs.map((l, k) => `<li><span class="n">${k + 1}</span>${shopName(l.from)} → ${shopName(l.to)} <b>+${fmt(l.revenue - l.cost)}</b>
+            · ${l.slots}/${S.slots} slots, ${fmt(l.w, 0)} kg · cash out ${fmt(l.cost)}<div class="goods">${goods(l.load)}</div></li>`).join("");
+        html += r.side.map(sd => `<li class="side"><span class="n">+</span>Side deal: buy at stop ${sd.fromStop + 1}, sell at stop ${sd.toStop + 1}
+            <b>+${fmt(sd.revenue - sd.cost)}</b><div class="goods">${goods(sd.load)}</div></li>`).join("");
+        html += `</ol><div class="row"><button class="primary" data-continue="${i}">Continue from ${shopName(r.path[r.path.length - 1])}</button></div>`;
+      }
+      html += `</div>`;
+    });
+    if (!html) html = `<div class="empty">No runs${start ? " from this start" : ""}. Try more legs, another vehicle or a different start.</div>`;
+  } else if (tab === "deals") {
+    DEALS.forEach((d, i) => {
+      if (q && !(pretty(d.name) + " " + BYID[d.X].name + " " + BYID[d.Y].name + " " + (d.viaTag || "")).toLowerCase().includes(q)) return;
+      const sel = selected?.kind === "deal" && selected.i === i;
+      html += `<div class="item${sel ? " sel" : ""}" data-kind="deal" data-i="${i}">
+        <div class="top"><span class="big">${esc(pretty(d.name))}${d.viaTag ? ` <span class="sub">as ${esc(d.viaTag)}</span>` : ""} +${fmt(d.profit)}</span><span class="rate">${fmt(d.rate)}/min · ${fmt(d.mins)} min</span></div>
+        <div class="path">${shopName(d.X)} (${fmt(d.buy, 2)}) → ${shopName(d.Y)} (${fmt(d.sell, 2)})</div>
+        <div class="path">${fmt(d.q, 0)} per trip · limited by ${esc(d.limitedBy)}${d.lead > 0.05 ? ` · ${fmt(d.lead)} min to get there` : ""}</div></div>`;
+    });
+    if (!html) html = `<div class="empty">No direct deals.</div>`;
+  } else {
+    if (selected?.kind === "shop" && BYID[selected.id]) html += shopDetail(BYID[selected.id]);
+    SHOPS.filter(s => !q || (s.name + " " + (s.owner || "") + " " + s.sells.concat(s.buys).map(o => pretty(o.item || o.tag)).join(" ")).toLowerCase().includes(q))
+      .sort((a, b) => (b.on && b.enabled) - (a.on && a.enabled) || a.name.localeCompare(b.name))
+      .forEach(s => {
+        if (selected?.kind === "shop" && selected.id === s.id) return;
+        html += `<div class="item" data-kind="shop" data-id="${s.id}"><div class="top"><span class="big">${esc(s.name)}</span>
+          <span class="rate" style="color:${s.on && s.enabled ? "var(--good)" : "var(--muted)"}">${s.on && s.enabled ? "open" : "closed"}</span></div>
+          <div class="path">${esc(s.owner)} · ${esc(s.currency || "barter")} · money ${s.balance === "infinite" ? "∞" : fmt(s.balance ?? 0)}</div></div>`;
+      });
+  }
+  list.innerHTML = html;
+  list.querySelectorAll(".item").forEach(el => el.onclick = ev => {
+    if (ev.target.closest("button")) return;
+    const k = el.dataset.kind;
+    if (k === "shop") return showShop(el.dataset.id);
+    const i = +el.dataset.i;
+    if (selected?.kind === k && selected.i === i) return;
+    selected = { kind: k, i }; render(); draw();
+  });
+  list.querySelectorAll("[data-continue]").forEach(b => b.onclick = () => {
+    const r = RUNS[+b.dataset.continue];
+    if (S.cash !== Infinity) { $("cash").value = Math.floor(S.cash + r.profit); saveForm(); }
+    DONE = r.st; doneRuns++;
+    setStart({ kind: "shop", id: r.path[r.path.length - 1] });
+  });
+  list.querySelectorAll("[data-start]").forEach(b => b.onclick = () => setStart({ kind: "shop", id: b.dataset.start }));
+}
+function shopDetail(s) {
+  const rows = (offers, buy) => offers.map(o => `<tr><td>${esc(pretty(o.item) || ("any " + o.tag))}</td><td class="num">${fmt(o.price, 2)}</td>
+    <td class="num">${buy ? (o.quantity === 999 && o.unlimited ? "any" : fmt(o.quantity, 0)) : fmt(o.quantity, 0)}</td></tr>`).join("");
+  return `<div class="detail"><h2>${esc(s.name)}</h2>
+    <div class="sub">${esc(s.owner)} · ${s.on && s.enabled ? "open" : "closed"} · ${esc(s.currency || "barter")} · money ${s.balance === "infinite" ? "∞" : fmt(s.balance ?? 0)} · x ${Math.round(s.x)}, z ${Math.round(s.z)}</div>
+    <div class="row" style="margin-top:6px"><button class="primary" data-start="${s.id}">Start here</button></div>
+    <table class="offers"><tr><th>Sells</th><th class="num">price</th><th class="num">stock</th></tr>${rows(s.sells, false) || '<tr><td colspan="3">—</td></tr>'}</table>
+    <table class="offers"><tr><th>Buys</th><th class="num">price</th><th class="num">can take</th></tr>${rows(s.buys, true) || '<tr><td colspan="3">—</td></tr>'}</table></div>`;
+}
+function showShop(id) { selected = { kind: "shop", id }; if (tab !== "shops") selectTab("shops"); else render(); $("list").scrollTop = 0; draw(); }
+
+// ---------------- boot ----------------
+initForm();
+new ResizeObserver(resize).observe(cv);
+loadMap(); load();
+$("refresh").addEventListener("click", loadMap);
+</script>
+</body>
+</html>

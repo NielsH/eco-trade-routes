@@ -1,0 +1,4 @@
+# Local data: save files (contain Steam ids), cached shop/item snapshots, rendered maps.
+data/
+__pycache__/
+*.pyc
