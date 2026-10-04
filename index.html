@@ -44,6 +44,7 @@ input, select { font: inherit; color: var(--ink); background: var(--field); bord
 details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .startinfo { font-size: 13px; }
 .startinfo b { color: var(--start); }
+.moved { margin-top: 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .tabs { display: flex; gap: 4px; padding: 8px 12px 0; }
 .tabs button { flex: 1; border-radius: 6px 6px 0 0; border-bottom: none; color: var(--muted); }
 .tabs button[aria-selected="true"] { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
@@ -225,6 +226,7 @@ async function load() {
     }));
     BYID = Object.fromEntries(SHOPS.map(s => [s.id, s]));
     PLAYERS = players.Players;
+    anchorPlayerStart();
     LIVE_VEHICLES = vehicles.Vehicles && vehicles.Vehicles.filter(v => !v.Error);
     const previousData = loadedAt;
     loadedAt = shops.GeneratedAt;
@@ -611,9 +613,45 @@ function startPosition() {
   if (!start) return null;
   if (start.kind === "pos") return { x: start.x, z: start.z };
   if (start.kind === "shop") return BYID[start.id] ? BYID[start.id].position : null;
-  if (start.kind === "player") { const p = (PLAYERS || []).find(p => p.Name === start.name); return p ? { x: p.Position.X, z: p.Position.Z } : null; }
+  if (start.kind === "player") {
+    if (!start.anchor) anchorPlayerStart();
+    return start.anchor || null;
+  }
   return null;
 }
+// A player start is planned from where the player was when the plan was made (the anchor), so the run list doesn't
+// reshuffle while they drive; the map shows them moving, and the start box offers to replan once they're well away.
+const livePlayer = name => { const p = (PLAYERS || []).find(p => p.Name === name); return p ? { x: p.Position.X, z: p.Position.Z } : null; };
+function anchorPlayerStart() {
+  if (start?.kind !== "player") return;
+  const at = livePlayer(start.name);
+  start.anchor = at ? { x: Math.round(at.x), z: Math.round(at.z) } : null;
+  store.set("start", start);
+}
+const MOVED_BLOCKS = 40;
+function movedFromAnchor() {
+  if (start?.kind !== "player" || !start.anchor) return 0;
+  const at = livePlayer(start.name);
+  return at ? Math.hypot(at.x - start.anchor.x, at.z - start.anchor.z) : 0;
+}
+
+// Live player positions: polled every few seconds while the page is visible. Only the map and the start box change;
+// plans don't (see the anchor above).
+const PLAYER_POLL_MS = 3000;
+let playerPoll = null;
+async function pollPlayers() {
+  if (document.hidden || PLAYERS == null) return;
+  try {
+    const r = await getJSON(API + "/players");
+    if (!r || !Array.isArray(r.Players)) return;
+    const before = (PLAYERS || []).map(p => p.Name).sort().join("|");
+    PLAYERS = r.Players;
+    if (r.Players.map(p => p.Name).sort().join("|") !== before && document.activeElement !== $("player")) fillPlayers();
+    renderStart(); draw();
+  } catch (e) { /* keep the last positions; the next poll tries again */ }
+}
+function startPlayerPoll() { clearInterval(playerPoll); playerPoll = setInterval(pollPlayers, PLAYER_POLL_MS); }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pollPlayers(); });
 
 let replanTimer = null;
 function replan() { clearTimeout(replanTimer); replanTimer = setTimeout(doReplan, 30); }
@@ -768,14 +806,16 @@ function fillPlayers() {
 }
 
 // ---------------- start ----------------
-function setStart(s) { start = s; store.set("start", s); if (s?.kind === "player") { store.set("me", s.name); fillVehicles(); } picking = false; updatePickUi(); replan(); }
+function setStart(s) { start = s; store.set("start", s); if (s?.kind === "player") { store.set("me", s.name); anchorPlayerStart(); fillVehicles(); } picking = false; updatePickUi(); replan(); }
 function renderStart() {
   const sp = startPosition();
   let t = "anywhere (runs begin at their first shop)";
   if (start?.kind === "shop") t = `shop <b>${esc(BYID[start.id]?.name || "?")}</b>`;
   if (start?.kind === "pos") t = `<b>${esc(start.label || "map point")}</b>`;
   if (start?.kind === "player") t = sp ? `player <b>${esc(start.name)}</b>` : `player ${esc(start.name)} <span class="err">(not online)</span>`;
+  const moved = movedFromAnchor();
   if (sp) t += ` <span class="sub">x ${Math.round(sp.x)}, z ${Math.round(sp.z)}</span>`;
+  if (moved >= MOVED_BLOCKS) t += `<div class="moved"><span class="sub">You've moved ${fmt(moved, 0)} blocks since this plan.</span><button data-replan-here>Replan from here</button></div>`;
   if (tradeCheck) {
     const open = tradeCheck.total - tradeCheck.seen;
     t += `<br><span class="sub">Data reloaded after your run: ${tradeCheck.seen} of ${tradeCheck.total} trades already visible on the server` +
@@ -784,6 +824,7 @@ function renderStart() {
   $("startText").innerHTML = t;
   if (start?.kind !== "player") $("player").value = "";
 }
+$("startText").addEventListener("click", e => { if (e.target.closest("[data-replan-here]")) { anchorPlayerStart(); replan(); } });
 function updatePickUi() { $("pick").classList.toggle("on", picking); $("banner").style.display = picking ? "block" : "none"; cv.classList.toggle("pick", picking); }
 $("pick").onclick = () => { picking = !picking; updatePickUi(); };
 $("clearStart").onclick = () => setStart(null);
@@ -1180,6 +1221,7 @@ function showShop(id) { selected = { kind: "shop", id }; if (tab !== "shops") se
 initForm();
 new ResizeObserver(resize).observe(cv);
 loadMap(); load();
+startPlayerPoll();
 $("refresh").addEventListener("click", loadMap);
 </script>
 </body>
