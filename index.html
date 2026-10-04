@@ -664,13 +664,15 @@ function initForm() {
 }
 // A placed vehicle's cargo. General storages (taking all or most items) count towards slots and weight; storages limited
 // to a few items (a log-only bay) only when the vehicle has nothing else. Tool buckets (skid steer, excavator, tractor)
-// aren't cargo and never appear in Storage, so those vehicles get no cargo at all.
+// aren't cargo and never appear in Storage, so those vehicles get no cargo at all. Nor are storages without a weight
+// limit: every transport vehicle has one, while farm machines (lawnmower, reaper, seed drill) only hold what they
+// harvest or sow, unweighed.
 function cargoOf(v) {
-  const all = (v.Storage || []).filter(s => s.Slots > 0), general = all.filter(s => !s.Accepts?.Only), use = general.length ? general : all;
+  const all = (v.Storage || []).filter(s => s.Slots > 0 && s.MaxWeight != null), general = all.filter(s => !s.Accepts?.Only), use = general.length ? general : all;
   if (!use.length) return null;
   return {
     slots: use.reduce((n, s) => n + s.Slots, 0),
-    maxWeightKg: use.every(s => s.MaxWeight != null) ? use.reduce((n, s) => n + s.MaxWeight, 0) / 1000 : 1e9,
+    maxWeightKg: use.reduce((n, s) => n + s.MaxWeight, 0) / 1000,
     speed: v.Speed, water: v.Water, storages: use, modules: v.Modules || [],
     roadMult: v.RoadMultiplier ?? VEHICLES[staticKey(v.Type)]?.roadMult ?? 1,   // older /vehicles without RoadMultiplier: the static table
   };
