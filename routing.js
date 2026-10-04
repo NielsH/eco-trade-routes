@@ -11,6 +11,23 @@
 //a route still exists when nothing better does but is ranked accordingly; steps of three or more (cliffs, ravine walls)
 //are closed. Roads and constructed ground are exempt: someone made them drivable.
 //
+//Vehicles can't climb a block off road: they drive down a step, but going up needs a ramp, which is part of a road. So
+//an edge that climbs (by the cells' median heights) is only open between two road cells. Edges are directed: the
+//search runs from the start outwards, so downhill off road is fine and the way back up has to use roads.
+//
+//A short stretch off road between patches of road is fine; a long one through country with nothing resembling a road
+//isn't (trees and rocks the map doesn't show, and slow going). Each cell knows how far it is from the nearest road or
+//constructed ground; beyond half the allowed off-road stretch (p.stretch, blocks) it is OFFROAD_DEEP slower again, so
+//a gap of up to p.stretch between two roads costs nothing extra and a cross-country leg is a last resort.
+//
+//The world wraps around (a torus): leaving the map on one side comes back on the other. Only boats can use that, since
+//the edges are ocean; a path that crosses the seam jumps from one side of the map to the other between two cells.
+//
+//Land vehicle + boat ("combo"): the player packs one vehicle up and carries it in the other, so a trip can switch between
+//land and water at any shore, both ways, for p.switchCost each time. The search then runs over two layers of the grid,
+//land and water; water time is scaled by p.waterScale (land speed / boat speed) so all times stay "seconds at the land
+//vehicle's speed 1".
+//
 //The world is reduced to cells of CELL x CELL blocks and searched with Dijkstra in a worker (window.Routing below).
 "use strict";
 (function () {
@@ -19,6 +36,7 @@
   const OFFROAD_STEEP = 0.15;     // off road with a natural step of STEEP_STEP blocks between neighbouring columns
   const STEEP_STEP = 2;
   const CLIFF_STEP = 3;           // off road with a step this high: impassable for land vehicles
+  const OFFROAD_DEEP = 0.1;       // off road, farther than half the allowed stretch from any road or constructed ground
   const SLOPE_COST = 2;           // extra time per block climbed per block driven
   const ROUGH_COST = 3;           // off road: slowdown per block of average step inside a cell
   const FREE_RADIUS = 3;          // cells around a shop where walls/steps don't block (getting out of the building)
@@ -41,7 +59,7 @@
     //Speed factor per cell for a vehicle: 1 + (surface - 1) * roadMult on roads and paved (constructed) ground; off road
     //also x offroad, slowed by roughness and forest.
     function effFor(p) {
-      const key = p.mode + "|" + p.roadMult + "|" + p.offroad;
+      const key = p.mode + "|" + p.roadMult + "|" + p.offroad + "|" + p.stretch;
       if (effs.has(key)) return effs.get(key);
       const n = G.N * G.N, e = new Float32Array(n);
       for (let c = 0; c < n; c++) {
@@ -53,6 +71,7 @@
           let v = (1 + (G.surf[c] - 1) * p.roadMult) * p.offroad / (1 + G.ROUGH_COST * G.rough[c]);
           if (G.forest[c]) v *= G.OFFROAD_FOREST;
           if (G.maxStep[c] >= G.STEEP_STEP) v *= G.OFFROAD_STEEP;
+          if (p.stretch != null && G.roadDist[c] * G.CELL > p.stretch / 2) v *= G.OFFROAD_DEEP;
           e[c] = v;
         }
         if (e[c] < 0.01) e[c] = 0.01;
@@ -69,14 +88,16 @@
       if (c < 0) return out;
       const row = (c / N) | 0, col = c % N;
       for (let dr = -r; dr <= r; dr++) for (let dc = -r; dc <= r; dc++) {
-        const rr = row + dr, cc = col + dc;
-        if (rr < 0 || rr >= N || cc < 0 || cc >= N) continue;
+        const rr = (row + dr + N) % N, cc = (col + dc + N) % N;   // the world wraps
         const v = rr * N + cc;
         if (ok(v)) out.push([v, G.CELL * Math.hypot(dr, dc)]);
       }
       return out;
     }
-    const okFor = p => p.mode === "water" ? c => G.water[c] === 1 : c => G.blocked[c] === 0 && G.cliff[c] === 0;
+    const okLand = c => G.blocked[c] === 0 && G.cliff[c] === 0, okWater = c => G.water[c] === 1;
+    //The layers a search runs over, each true for water: a land vehicle, a boat, or both (combo).
+    const layersFor = p => p.mode === "combo" ? [false, true] : [p.mode === "water"];
+    const okIn = water => water ? okWater : okLand;
 
     //Binary heap of (key, node) with lazy deletion.
     function heap() {
@@ -106,70 +127,87 @@
       };
     }
 
-    //Dijkstra from every usable cell near src, over the whole grid. Seconds at speed 1 (divide by the vehicle speed).
+    //Dijkstra from every usable cell near src, over the whole grid and each layer (state = layer * n + cell). Seconds at
+    //speed 1 (divide by the vehicle speed; in combo, the land vehicle's).
     function search(p, src, wantPred) {
-      const N = G.N, n = N * N, e = effFor(p), water = p.mode === "water", ok = okFor(p);
-      const dist = new Float64Array(n).fill(Infinity), done = new Uint8Array(n), pred = wantPred ? new Int32Array(n).fill(-1) : null;
+      const N = G.N, n = N * N, e = effFor(p), layers = layersFor(p), L = layers.length;
+      const waterScale = p.mode === "combo" ? p.waterScale : 1, switchCost = p.switchCost || 0;
+      const dist = new Float64Array(L * n).fill(Infinity), done = new Uint8Array(L * n), pred = wantPred ? new Int32Array(L * n).fill(-1) : null;
       const h = heap();
-      for (const [c, d] of near(src, ok)) if (d < dist[c]) { dist[c] = d; h.push(d, c); }
+      layers.forEach((water, li) => { for (const [c, d] of near(src, okIn(water))) if (d < dist[li * n + c]) { dist[li * n + c] = d; h.push(d, li * n + c); } });
       const D = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]];
       while (h.size) {
-        const u = h.pop(), du = h.k;
-        if (done[u]) continue;
-        done[u] = 1;
-        const ur = (u / N) | 0, uc = u % N;
+        const s = h.pop(), ds = h.k;
+        if (done[s]) continue;
+        done[s] = 1;
+        const li = (s / n) | 0, u = s - li * n, water = layers[li], ur = (u / N) | 0, uc = u % N;
         for (const [dr, dc] of D) {
-          const vr = ur + dr, vc = uc + dc;
-          if (vr < 0 || vr >= N || vc < 0 || vc >= N) continue;
-          const v = vr * N + vc;
-          if (done[v] || !ok(v)) continue;
-          const len = G.CELL * (dr && dc ? Math.SQRT2 : 1);
-          let secs;
-          if (water) secs = len;
-          else {
-            const dh = Math.abs(G.h[u] - G.h[v]);
-            if (dh > len) continue;                                // more than one block up per block: a cliff or a wall
-            secs = len / ((e[u] + e[v]) / 2) * (1 + G.SLOPE_COST * dh / len);
+          const vr = (ur + dr + N) % N, vc = (uc + dc + N) % N;   // the world wraps
+          const v = vr * N + vc, len = G.CELL * (dr && dc ? Math.SQRT2 : 1);
+          for (let lj = 0; lj < L; lj++) {
+            const t = lj * n + v, toWater = layers[lj];
+            if (done[t] || !okIn(toWater)(v)) continue;
+            let secs;
+            if (lj !== li) secs = switchCost + len * (toWater ? waterScale : 1);   // at the shore: pack one vehicle into the other
+            else if (water) secs = len * waterScale;
+            else {
+              const climb = G.h[v] - G.h[u], dh = Math.abs(climb);
+              if (dh > len) continue;                                // more than one block up per block: a cliff or a wall
+              if (climb >= 1 && !(G.ramp[u] && G.ramp[v])) continue;   // up a block off road: needs a ramp
+              secs = len / ((e[u] + e[v]) / 2) * (1 + G.SLOPE_COST * dh / len);
+            }
+            const nd = ds + secs;
+            if (nd < dist[t]) { dist[t] = nd; if (pred) pred[t] = s; h.push(nd, t); }
           }
-          const nd = du + secs;
-          if (nd < dist[v]) { dist[v] = nd; if (pred) pred[v] = u; h.push(nd, v); }
         }
       }
-      return { dist, pred };
+      return { dist, pred, layers, n };
     }
 
-    //Arrival at t: the best usable cell near it, plus the stretch to the counter. [seconds, cell]
-    function arrive(r, t, ok) {
-      let best = Infinity, cell = -1;
-      for (const [c, d] of near(t, ok)) if (r.dist[c] + d < best) { best = r.dist[c] + d; cell = c; }
-      return [best, cell];
+    //Arrival at t: the best usable cell near it in any layer, plus the stretch to the counter. [seconds, state]
+    function arrive(r, t) {
+      let best = Infinity, state = -1;
+      r.layers.forEach((water, li) => {
+        for (const [c, d] of near(t, okIn(water))) { const v = r.dist[li * r.n + c] + d; if (v < best) { best = v; state = li * r.n + c; } }
+      });
+      return [best, state];
     }
 
     function matrix(m) {
-      const n = m.cells.length, ok = okFor(m.p), times = new Float64Array(n * n).fill(Infinity);
+      const n = m.cells.length, times = new Float64Array(n * n).fill(Infinity);
       for (let i = 0; i < n; i++) {
         const r = search(m.p, m.cells[i], false);
-        for (let j = 0; j < n; j++) times[i * n + j] = i === j ? 0 : arrive(r, m.cells[j], ok)[0];
+        for (let j = 0; j < n; j++) times[i * n + j] = i === j ? 0 : arrive(r, m.cells[j])[0];
         if (i % 5 === 0) self.postMessage({ id: m.id, progress: i / n });
       }
       self.postMessage({ id: m.id, times }, [times.buffer]);
     }
 
     function row(m) {
-      const r = search(m.p, m.start, false), ok = okFor(m.p);
-      const times = Float64Array.from(m.cells, c => arrive(r, c, ok)[0]);
+      const r = search(m.p, m.start, false);
+      const times = Float64Array.from(m.cells, c => arrive(r, c)[0]);
       self.postMessage({ id: m.id, times }, [times.buffer]);
     }
 
+    //The route itself: its cells, which of them are by boat, its share on roads (or constructed ground), the longest
+    //stretch without one, and how often it switches vehicle.
     function path(m) {
-      const r = search(m.p, m.from, true), [seconds, end] = arrive(r, m.to, okFor(m.p));
+      const r = search(m.p, m.from, true), [seconds, end] = arrive(r, m.to);
       if (!isFinite(seconds)) return self.postMessage({ id: m.id, cells: null });
-      const cells = [];
-      for (let c = end; c !== -1; c = r.pred[c]) cells.push(c);
-      cells.reverse();
-      let road = 0;
-      for (const c of cells) if (G.road[c] > 0 || G.paved[c]) road++;
-      self.postMessage({ id: m.id, cells, onRoad: road / cells.length, seconds });
+      const states = [];
+      for (let s = end; s !== -1; s = r.pred[s]) states.push(s);
+      states.reverse();
+      const cells = states.map(s => s % r.n), boat = Uint8Array.from(states, s => r.layers[(s / r.n) | 0] ? 1 : 0);
+      let road = 0, run = 0, longest = 0, water = 0, switches = 0;
+      cells.forEach((c, i) => {
+        if (i && boat[i] !== boat[i - 1]) switches++;
+        if (boat[i]) { water++; run = 0; }
+        else if (G.road[c] > 0 || G.paved[c]) { road++; run = 0; }
+        else longest = Math.max(longest, ++run);
+      });
+      const land = cells.length - water;
+      self.postMessage({ id: m.id, cells, boat, onRoad: land ? road / land : 0, offroadBlocks: longest * G.CELL,
+        boatShare: water / cells.length, switches, seconds });
     }
   }
 
@@ -216,10 +254,10 @@
     const natural = new Map(Object.entries(colors.natural).map(([k, v]) => [hexInt(k), v]));
     const riverbed = new Set(colors.riverbed.map(hexInt)), forestSet = new Set(colors.forest.map(hexInt));
     const n = N * N;
-    const g = { N, CELL, SLOPE_COST, ROUGH_COST, OFFROAD_FOREST, OFFROAD_STEEP, STEEP_STEP, FREE_RADIUS,
+    const g = { N, CELL, SLOPE_COST, ROUGH_COST, OFFROAD_FOREST, OFFROAD_STEEP, STEEP_STEP, OFFROAD_DEEP, FREE_RADIUS,
       h: new Float32Array(n), road: new Float32Array(n), surf: new Float32Array(n), rough: new Float32Array(n),
       forest: new Uint8Array(n), paved: new Uint8Array(n), blocked: new Uint8Array(n), water: new Uint8Array(n),
-      maxStep: new Uint8Array(n), cliff: new Uint8Array(n) };
+      maxStep: new Uint8Array(n), cliff: new Uint8Array(n), roadDist: new Uint16Array(n) };
     //Per pixel: the largest height step to a neighbouring column, where both are natural dry ground (a step onto a
     //road, a wall or into water says nothing about how rough the land is).
     const nat = new Uint8Array(size * size), pxStep = new Uint8Array(size * size);
@@ -267,6 +305,21 @@
       g.maxStep[cell] = maxStep;
       g.cliff[cell] = maxStep >= CLIFF_STEP && roadEff === 0 && !g.paved[cell] ? 1 : 0;
     }
+    g.ramp = new Uint8Array(n);   // roads and constructed ground: where a climb can be made (ramps, built slopes)
+    for (let c = 0; c < n; c++) g.ramp[c] = g.road[c] > 0 || g.paved[c] ? 1 : 0;
+    //Cells to the nearest road or constructed ground (breadth-first from all of them at once; the world wraps).
+    const queue = new Int32Array(n);
+    let head = 0, tail = 0;
+    g.roadDist.fill(65535);
+    for (let c = 0; c < n; c++) if (g.road[c] > 0 || g.paved[c]) { g.roadDist[c] = 0; queue[tail++] = c; }
+    while (head < tail) {
+      const u = queue[head++], ur = (u / N) | 0, uc = u % N, d = g.roadDist[u] + 1;
+      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        if (!dr && !dc) continue;
+        const v = ((ur + dr + N) % N) * N + (uc + dc + N) % N;
+        if (g.roadDist[v] > d) { g.roadDist[v] = d; queue[tail++] = v; }
+      }
+    }
     return g;
   }
 
@@ -308,7 +361,10 @@
       const from = cellOf(a.x, a.z, size), to = cellOf(b.x, b.z, size), key = JSON.stringify([p, from, to]);
       if (!pathCache.has(key)) pathCache.set(key, call({ type: "path", p, from, to }));
       const r = await pathCache.get(key);
-      return r.cells ? { points: [a, ...r.cells.map(c => centerOf(c, size)), b], onRoad: r.onRoad, seconds: r.seconds } : null;
+      if (!r.cells) return null;
+      const boat = [r.boat[0] || 0, ...r.boat, r.boat[r.boat.length - 1] || 0];   // per point: by boat (the ends take their neighbour's)
+      return { points: [a, ...r.cells.map(c => centerOf(c, size)), b], boat, onRoad: r.onRoad, offroadBlocks: r.offroadBlocks,
+        boatShare: r.boatShare, switches: r.switches, seconds: r.seconds };
     },
   };
 })();

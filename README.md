@@ -37,9 +37,12 @@ point it elsewhere with `?server=https://your.server`.
   built-in table (`vehicles.js`) for types nobody has placed. Only hauling vehicles are offered: digging and farming
   vehicles (excavator, skid steer, tractors) load into a tool bucket, not cargo. A vehicle's own item rules apply, e.g.
   the Scorpion only takes logs, 100 per slot.
+- **Boat for water crossings**: pick a boat to bring along with a land vehicle. You pack one vehicle up and carry it in
+  the other, so routes switch between land and water at any shore (both ways), each switch costing "Switch min" (default
+  1). Cargo is limited by the smaller of the two vehicles; the map draws boat stretches with a blue edge and the run card
+  says how much of a leg is by boat.
 - **Settings**: vehicle slots, max kg and speed (editable), cash limit, legs, currency, time per stop, road
-  factor (road distance / straight line) and a sale bonus %. Turn on edge wrap for boats only: on a world ringed by
-  ocean, land vehicles can't cross the edge.
+  factor (road distance / straight line) and a sale bonus %.
 
 ## Routing
 
@@ -52,9 +55,13 @@ Travel times are routed over the real map (`routing.js`, in a background worker;
   Forest without a road (trees aren't on the map but block vehicles) and ground with natural 2-block steps are about 7×
   slower again, so a run only crosses them when there's no real alternative.
 - **Water** is impassable for land vehicles unless something is built on it (a bridge). Boats only move on water and
-  can reach a shop within about 12 blocks of it. The map doesn't draw water, so it's inferred: riverbed, or natural
+  can reach a shop within about 12 blocks of it. The world wraps around, so a boat can sail off one edge of the
+  map and come back on the opposite one. The map doesn't draw water, so it's inferred: riverbed, or natural
   ground below sea level.
 - **Cliffs and walls** (natural steps of 3+ blocks off road, or more than one block up per block) can't be driven.
+- **Long stretches without a road** are about 10× slower again: farther than half the "Off-road gap" setting (default 80
+  blocks) from any road or built-up ground. A short hop between two patches of road costs nothing extra; a route across
+  open country only wins when there's no alternative, and the run card flags such a leg.
 - **Not visible from above**: tunnels, and anything under a roof. Shops that can't be reached are left out of runs.
 
 The map shows each leg along its route with its share on roads. Switch "Travel time" to "straight line × road factor"

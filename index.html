@@ -118,6 +118,7 @@ table.offers { width: 100%; border-collapse: collapse; font-size: 12px; margin-t
         <summary>Vehicle, cash and planning settings</summary>
         <div class="grid">
           <label style="grid-column: span 2">Vehicle<select id="vehicle"></select></label>
+          <label style="grid-column: span 2" title="Bring a boat too: routes can switch between land and water at any shore, carrying the other vehicle along">Boat for water crossings<select id="boat"></select></label>
           <label>Slots<input id="slots" type="number" min="1"></label>
           <label>Max kg<input id="maxkg" type="number" min="1"></label>
           <label>Speed<input id="speed" type="number" min="1" step="0.5"></label>
@@ -126,11 +127,12 @@ table.offers { width: 100%; border-collapse: collapse; font-size: 12px; margin-t
           <label>Min legs<input id="minLegs" type="number" min="1" max="8"></label>
           <label style="grid-column: span 2">Currency<select id="currency"></select></label>
           <label>Stop min<input id="stopMin" type="number" min="0" step="0.5"></label>
+          <label title="Minutes to pack up one vehicle, place the other and move the cargo across, each time a route switches between land and boat">Switch min<input id="switchMin" type="number" min="0" step="0.5"></label>
           <label>Road factor<input id="routeFactor" type="number" min="1" step="0.1"></label>
           <label>Bonus %<input id="bonus" type="number" min="0" step="1"></label>
-          <label>Wrap edges<select id="wrap"><option value="0">no (land)</option><option value="1">yes (boats)</option></select></label>
           <label style="grid-column: span 2">Travel time<select id="routing"><option value="terrain">routed over roads and terrain</option><option value="straight">straight line x road factor</option></select></label>
           <label>Off-road speed<input id="offroad" type="number" min="0.05" max="1" step="0.05" title="Speed off roads, relative to the same ground on a road (trees, rocks, bumps)"></label>
+          <label>Off-road gap<input id="stretch" type="number" min="0" step="10" title="Longest stretch without a road a route may cross at normal off-road speed, in blocks. Farther from any road or town it's 10x slower, so routes stick to roads."></label>
         </div>
         <div class="sub" id="cargoNote" style="margin-top:4px"></div>
       </details>
@@ -312,7 +314,10 @@ let ROUTE = null, START_ROW = null, routeWanted = null, rowWanted = null, routeP
 let routeGen = 0, routingFailed = false;
 const routingMessage = () => !window.Routing?.ready ? "Loading the map for routing…" : `Calculating routes over roads and terrain… ${Math.round((routeProgress || 0) * 100)}%`;
 const routingPending = () => S.routing === "terrain" && !routingFailed && (!routesOn || (!!startPosition() && !rowOn));
-const routeParams = () => ({ mode: S.water ? "water" : "land", roadMult: S.water ? 1 : S.roadMult, offroad: S.water ? 1 : S.offroad });
+const routeParams = () => S.water ? { mode: "water", roadMult: 1, offroad: 1, stretch: null }
+  : S.boatSpeed ? { mode: "combo", roadMult: S.roadMult, offroad: S.offroad, stretch: S.stretch,
+      waterScale: S.speed / S.boatSpeed, switchCost: S.switchMin * 60 * S.speed }   // times stay "seconds at the land vehicle's speed 1"
+  : { mode: "land", roadMult: S.roadMult, offroad: S.offroad, stretch: S.stretch };
 const matrixKey = () => JSON.stringify([routeParams(), M ? M.open.map(s => s.id) : []]);
 const rowKey = sp => matrixKey() + JSON.stringify(sp ? [Math.round(sp.x), Math.round(sp.z)] : null);
 function legMinutes(X, Y) {
@@ -355,10 +360,12 @@ function storageTakes(st, name) {
   return a.Only ? st._only.has(name) : !st._except.has(name);
 }
 const takerOf = name => CARGO.storages.find(st => storageTakes(st, name));
-const fits = name => !CARGO.storages.length || !!takerOf(name);
+const boatTakerOf = name => CARGO.boat && CARGO.boat.find(st => storageTakes(st, name));
+// With a boat along, an item has to fit both vehicles, at the smaller of their stack sizes.
+const fits = name => (!CARGO.storages.length || !!takerOf(name)) && (!CARGO.boat?.length || !!boatTakerOf(name));
 function stackOf(name) {
-  const it = itemInfo(name), ss = CARGO.storages.length ? takerOf(name)?.StackSizes : null;
-  return ss?.All ?? ss?.Items?.[name] ?? it.stackSize;
+  const it = itemInfo(name), per = st => st?.StackSizes?.All ?? st?.StackSizes?.Items?.[name] ?? it.stackSize;
+  return Math.min(CARGO.storages.length ? per(takerOf(name)) : it.stackSize, CARGO.boat?.length ? per(boatTakerOf(name)) : Infinity);
 }
 const mod = (a, n) => ((a % n) + n) % n;
 
@@ -691,14 +698,14 @@ function showStatus() {
 // ---------------- settings ----------------
 // Cargo rules of the chosen vehicle; slots/max kg/speed live in the form so they stay editable.
 let CARGO = { storages: [] };
-const FIELDS = { vehicle: "s:PoweredCart", slots: "", maxkg: "", speed: "", cash: "", legs: 4, minLegs: 1, currency: "", stopMin: 1, routeFactor: 1.3, bonus: 0, wrap: "0", routing: "terrain", offroad: 0.5 };
+const FIELDS = { vehicle: "s:PoweredCart", slots: "", maxkg: "", speed: "", cash: "", legs: 4, minLegs: 1, currency: "", stopMin: 1, routeFactor: 1.3, bonus: 0, routing: "terrain", offroad: 0.5, stretch: 80, boat: "", switchMin: 1 };
 function initForm() {
   fillVehicles();
-  for (const [id, d] of Object.entries(FIELDS)) if (id !== "vehicle") $(id).value = store.get("f." + id, d);
+  for (const [id, d] of Object.entries(FIELDS)) if (id !== "vehicle" && id !== "boat") $(id).value = store.get("f." + id, d);
   if (!$("slots").value) vehicleDefaults();
-  $("vehicle").addEventListener("change", () => { vehicleDefaults(); saveForm(); replan(); });
+  for (const id of ["vehicle", "boat"]) $(id).addEventListener("change", () => { vehicleDefaults(); saveForm(); replan(); });
   applyCargo();
-  for (const id of Object.keys(FIELDS)) if (id !== "vehicle") $(id).addEventListener("change", () => { saveForm(); replan(); });
+  for (const id of Object.keys(FIELDS)) if (id !== "vehicle" && id !== "boat") $(id).addEventListener("change", () => { saveForm(); replan(); });
 }
 // A placed vehicle's cargo. General storages (taking all or most items) count towards slots and weight; storages limited
 // to a few items (a log-only bay) only when the vehicle has nothing else. Tool buckets (skid steer, excavator, tractor)
@@ -760,19 +767,40 @@ function fillVehicles() {
   const base = keep.startsWith("t:") ? staticKey(keep.slice(2)) : keep.startsWith("s:") ? keep.slice(2) : keep.includes(":") ? null : keep;
   const tries = [keep, base && "t:" + base + "Object", base && "s:" + base, "t:PoweredCartObject", "s:PoweredCart"];
   sel.value = tries.find(v => v && values.includes(v)) || values[0];
+  fillBoats(mine, types, statics, desc, opt);
   applyCargo();
 }
+function fillBoats(mine, types, statics, desc, opt) {
+  const sel = $("boat"), keep = sel.value || store.get("f.boat", FIELDS.boat);
+  const isBoat = value => !!vehicleSpec(value)?.water;
+  let html = opt("", "none (land only)");
+  const myBoats = mine.filter(v => cargoOf(v).water);
+  if (myBoats.length) html += `<optgroup label="Your boats">` + myBoats.map(v => opt("v:" + v.Id, `${v.Name} · ${desc(cargoOf(v))}`)).join("") + "</optgroup>";
+  const boatTypes = types.filter(t => isBoat("t:" + t));
+  if (boatTypes.length) html += `<optgroup label="On the server">` + boatTypes.map(t => { const v = bestOfType(t); return opt("t:" + t, `${v.Name} · ${desc(cargoOf(v))}`); }).join("") + "</optgroup>";
+  const staticBoats = statics.filter(([k, v]) => v.water && v.slots);
+  if (staticBoats.length) html += `<optgroup label="Not placed on the server">` + staticBoats.map(([k]) => opt("s:" + k, pretty(k))).join("") + "</optgroup>";
+  sel.innerHTML = html;
+  const values = [...sel.options].map(o => o.value);
+  sel.value = values.includes(keep) ? keep : "";
+  sel.disabled = isBoat($("vehicle").value);   // already on water
+}
+// The boat brought along, when the vehicle itself is a land vehicle.
+const boatSpec = () => { const v = $("boat").value; return v && !vehicleSpec($("vehicle").value)?.water ? vehicleSpec(v) : null; };
 function applyCargo() {
-  const c = vehicleSpec($("vehicle").value) || {};
-  CARGO = { storages: c.storages || [] };
+  const c = vehicleSpec($("vehicle").value) || {}, b = boatSpec();
+  CARGO = { storages: c.storages || [], boat: b ? b.storages || [] : null };
   const notes = cargoLimits(c);
+  if (b) notes.push(`with a boat (${b.slots} slots, ${fmt(b.maxWeightKg, 0)} kg, speed ${b.speed}): cargo is limited by the smaller of the two` + (cargoLimits(b).length ? ", boat: " + cargoLimits(b).join(", ") : ""));
   if (c.modules && c.modules.length) notes.push("modules: " + c.modules.map(pretty).join(", "));
   $("cargoNote").textContent = notes.length ? "Cargo: " + notes.join(" · ") : "";
 }
 function vehicleDefaults() {
-  const c = vehicleSpec($("vehicle").value) || {};
-  $("slots").value = c.slots ?? ""; $("maxkg").value = c.maxWeightKg ?? ""; $("speed").value = c.speed ?? "";
-  $("wrap").value = c.water ? "1" : "0";
+  const c = vehicleSpec($("vehicle").value) || {}, b = boatSpec();
+  $("boat").disabled = !!c.water;
+  const both = (x, y) => x == null ? y : y == null ? x : Math.min(x, y);
+  $("slots").value = (b ? both(c.slots, b.slots) : c.slots) ?? ""; $("maxkg").value = (b ? both(c.maxWeightKg, b.maxWeightKg) : c.maxWeightKg) ?? "";
+  $("speed").value = c.speed ?? "";
   applyCargo();
   if (!c.slots) $("settingsBox").open = true;
 }
@@ -784,10 +812,14 @@ function readSettings() {
     cash: $("cash").value === "" ? Infinity : Math.max(0, num("cash", 0)),
     legs: Math.min(8, Math.max(1, num("legs", 4))), minLegs: Math.max(1, num("minLegs", 1)),
     currency: $("currency").value, stopMinutes: Math.max(0, num("stopMin", 1)), routeFactor: Math.max(1, num("routeFactor", 1.3)),
-    bonus: Math.max(0, num("bonus", 0)) / 100, wrap: $("wrap").value === "1",
+    bonus: Math.max(0, num("bonus", 0)) / 100,
     routing: $("routing").value === "straight" ? "straight" : "terrain", offroad: Math.min(1, Math.max(0.05, num("offroad", 0.5))),
+    stretch: Math.max(0, num("stretch", 80)), switchMin: Math.max(0, num("switchMin", 1)),
     roadMult: (vehicleSpec($("vehicle").value) || {}).roadMult ?? 1, water: !!(vehicleSpec($("vehicle").value) || {}).water,
   });
+  S.wrap = S.water;   // the world wraps; only boats can cross the edge (it's ocean), so straight lines wrap for boats only
+  const b = boatSpec();
+  S.boatSpeed = b ? Math.max(0.5, b.speed || S.speed) : null;   // a boat brought along (land vehicle + boat)
 }
 function fillCurrencies() {
   const counts = {};
@@ -901,10 +933,13 @@ function routeArrow(a, b, color, width, text, dashed) {
   const r = legPath(a, b);
   if (!r) return;                                                          // being computed (tens of ms): drawn when it lands
   if (!r.points || r.points.length < 2) return arrow(a, b, color, width, text, true);
-  const pts = r.points.map(p => toScreen(p.x, p.z));
+  const segs = worldSegments(r.points, r.boat).map(seg => seg.map(p => toScreen(p.x, p.z)));
+  const pts = segs.reduce((m, s) => s.length > m.length ? s : m, []);     // arrow and label on the longest piece
   ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width; ctx.lineCap = "round"; ctx.lineJoin = "round";
   if (dashed) ctx.setLineDash([6, 5]);
-  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (const [x, y] of pts.slice(1)) ctx.lineTo(x, y); ctx.stroke(); ctx.setLineDash([]);
+  for (const seg of segs) { ctx.beginPath(); ctx.moveTo(seg[0][0], seg[0][1]); for (const [x, y] of seg.slice(1)) ctx.lineTo(x, y); ctx.stroke(); }
+  ctx.setLineDash([]);
+  if (pts.length < 2) { ctx.restore(); return; }
   const mid = Math.floor(pts.length * 0.55), [x1, y1] = pts[Math.max(0, mid - 3)], [x2, y2] = pts[Math.min(pts.length - 1, mid + 3)];
   const ang = Math.atan2(y2 - y1, x2 - x1), h = 7 + width, [hx, hy] = pts[mid];
   if (Math.hypot(x2 - x1, y2 - y1) > 2) {
@@ -919,19 +954,35 @@ function routeArrow(a, b, color, width, text, dashed) {
   }
   ctx.restore();
 }
-const drawLeg = (a, b, color, width, text, dashed) => S.routing === "terrain" && !S.water ? routeArrow(a, b, color, width, text, dashed) : arrow(a, b, color, width, text, dashed);
+const drawLeg = (a, b, color, width, text, dashed) => S.routing === "terrain" ? routeArrow(a, b, color, width, text, dashed) : arrow(a, b, color, width, text, dashed);
+// A routed path in world coordinates, cut where it crosses the world's edge (it wraps: a boat sailing off the west side
+// comes back on the east), so it isn't drawn as a line across the whole map.
+// Also cut where a land vehicle + boat route switches vehicle; each piece says whether it's by boat (seg.boat).
+function worldSegments(points, boat) {
+  const start = (i, from) => { const s = from ? [from] : []; s.boat = !!(boat && boat[i]); return s; };
+  const segs = [start(0)];
+  segs[0].push(points[0]);
+  for (let i = 1; i < points.length; i++) {
+    const p = points[i], q = points[i - 1];
+    if (Math.abs(p.x - q.x) > W / 2 || Math.abs(p.z - q.z) > W / 2) segs.push(start(i));
+    else if (boat && boat[i] !== boat[i - 1]) segs.push(start(i, q));   // switch: the new piece starts where the old one ended
+    segs[segs.length - 1].push(p);
+  }
+  return segs.filter(s => s.length >= 2);
+}
 
 // A run's legs. Legs often share a road (out and back, or two legs along one stretch), so each is drawn as its own lane:
 // shifted to its right (legs in opposite directions separate, like traffic) and a little further for each later leg, in
 // its own colour, with arrows along it. The card's drive lines use the same colours; hovering one fades the others.
 const LEG_COLORS = ["#ff7a3d", "#12b886", "#e64980", "#f6c026", "#4c6ef5", "#82c91e", "#fa5252", "#15aabf"];
 const legColor = k => LEG_COLORS[k % LEG_COLORS.length];
-// Screen points of a leg's routed path; null while it's computed, { none: true } when routing found no path.
+// Screen polylines of a leg's routed path (more than one where it crosses the world's edge); null while it's computed,
+// { none: true } when routing found no path.
 function legScreenPoints(a, b) {
   const r = legPath(a, b);
   if (!r) return null;
   if (!r.points || r.points.length < 2) return { none: true };
-  return smooth(dedupe(r.points.map(p => toScreen(p.x, p.z))));
+  return worldSegments(r.points, r.boat).map(seg => { const pts = smooth(dedupe(seg.map(p => toScreen(p.x, p.z)))); pts.boat = seg.boat; return pts; });
 }
 function dedupe(pts) {   // zoomed out, many path cells share a pixel
   const out = [pts[0]];
@@ -955,10 +1006,10 @@ function offsetLine(pts, d) {   // shift to the right of the direction of travel
     return [p[0] - dy / L * d, p[1] + dx / L * d];
   });
 }
-function strokeLane(pts, color, width, faded) {
+function strokeLane(pts, color, width, faded, boat) {
   ctx.save(); ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.globalAlpha = faded ? 0.22 : 1;
   ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (const [x, y] of pts.slice(1)) ctx.lineTo(x, y);
-  ctx.strokeStyle = "rgba(0,0,0,.55)"; ctx.lineWidth = width + 2.5; ctx.stroke();
+  ctx.strokeStyle = boat ? "#4dabf7" : "rgba(0,0,0,.55)"; ctx.lineWidth = width + (boat ? 4 : 2.5); ctx.stroke();   // by boat: a blue edge
   ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
   // arrows every ~70 px along the lane, starting half a gap in
   const gap = 70, h = 5 + width;
@@ -979,16 +1030,16 @@ function strokeLane(pts, color, width, faded) {
 }
 function drawLegs(legs) {   // legs: [{ from, to }] as positions
   const width = 3.2, lanes = [];
-  const routed = S.routing === "terrain" && !S.water;   // the same test as drawLeg: straight arrows only when routing is off or for boats
+  const routed = S.routing === "terrain";   // the same test as drawLeg: straight arrows only when routing is off
   legs.forEach((l, k) => {
     if (!routed) return arrow(l.from, l.to, legColor(k), width, "", false);
-    const pts = legScreenPoints(l.from, l.to);
-    if (!pts) return;                                                            // being computed: drawn when it lands
-    if (pts.none) return arrow(l.from, l.to, legColor(k), width, "", true);       // no route found: dashed, as before
-    lanes.push({ k, pts: offsetLine(pts, 3 + k * 3) });
+    const segs = legScreenPoints(l.from, l.to);
+    if (!segs) return;                                                            // being computed: drawn when it lands
+    if (segs.none) return arrow(l.from, l.to, legColor(k), width, "", true);      // no route found: dashed, as before
+    for (const pts of segs) lanes.push({ k, pts: offsetLine(pts, 3 + k * 3), boat: pts.boat });
   });
   const order = lanes.filter(l => l.k !== hoverLeg).concat(lanes.filter(l => l.k === hoverLeg));   // the hovered leg on top
-  for (const l of order) strokeLane(l.pts, legColor(l.k), hoverLeg === l.k ? width + 1.5 : width, hoverLeg != null && hoverLeg !== l.k);
+  for (const l of order) strokeLane(l.pts, legColor(l.k), hoverLeg === l.k ? width + 1.5 : width, hoverLeg != null && hoverLeg !== l.k, l.boat);
 }
 // Stop numbers on the shops, as in the card; a shop visited twice shows both ("1·3").
 function drawStopNumbers(path) {
@@ -1192,7 +1243,10 @@ function runCard(r) {
   };
   const roadText = (a, b) => {
     const p = S.routing === "terrain" && !S.water && PATHS.get(JSON.stringify([routeParams(), Math.round(a.x), Math.round(a.z), Math.round(b.x), Math.round(b.z)]));
-    return p && p.points ? ` · ${Math.round(p.onRoad * 100)}% road` : "";
+    if (!p || !p.points) return "";
+    const boat = p.boatShare > 0 ? ` · ⛵ ${Math.round(p.boatShare * 100)}% by boat` + (p.switches ? `, ${p.switches} switch${p.switches > 1 ? "es" : ""}` : "") : "";
+    return (p.boatShare < 1 ? ` · ${Math.round(p.onRoad * 100)}% road` : "") + boat +
+      (p.offroadBlocks > S.stretch ? ` · <span class="err">${fmt(p.offroadBlocks, 0)} blocks without a road</span>` : "");
   };
   let html = `<div class="steps">`;
   if (r.lead > 0.05) html += `<div class="drive start">Drive to the first stop · ${fmt(r.lead)} min${roadText(startPosition(), BYID[r.path[0]])}</div>`;
