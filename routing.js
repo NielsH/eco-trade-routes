@@ -28,6 +28,12 @@
 //land and water; water time is scaled by p.waterScale (land speed / boat speed) so all times stay "seconds at the land
 //vehicle's speed 1".
 //
+//Tunnels and overpasses: the map shows what's on top, so a road through a tunnel or under a bridge looks cut by a wall.
+//Where a straight road stops for at most TUNNEL_GAP blocks and carries on in the same line (at least TUNNEL_RUN road
+//blocks on each side, ends within 2 blocks of each other in height) under something at least 2 blocks above it, the
+//road is assumed to continue underneath. Requiring the road to carry on in line keeps a building between two parallel
+//streets from counting.
+//
 //The world is reduced to cells of CELL x CELL blocks and searched with Dijkstra in a worker (window.Routing below).
 "use strict";
 (function () {
@@ -40,6 +46,7 @@
   const SLOPE_COST = 2;           // extra time per block climbed per block driven
   const ROUGH_COST = 3;           // off road: slowdown per block of average step inside a cell
   const FREE_RADIUS = 3;          // cells around a shop where walls/steps don't block (getting out of the building)
+  const TUNNEL_GAP = 16, TUNNEL_RUN = 8;   // blocks: longest covered stretch of road, and the straight road needed on each side
 
   //---------------------------------------------------------------- worker ----------------------------------------------------------------
   function workerMain() {
@@ -275,18 +282,49 @@
         if (d > pxStep[q]) pxStep[q] = d;
       }
     }
+    //Roads under tunnels and overpasses (see the top): per pixel, the road speed factor it gets and its road height.
+    const tunnelEff = new Float32Array(size * size), tunnelH = new Float32Array(size * size);
+    const roadAt = px => { const i = px * 4; return road.get((tp[i] << 16) | (tp[i + 1] << 8) | tp[i + 2]) || 0; };
+    const isRoad = new Float32Array(size * size);
+    for (let px = 0; px < size * size; px++) isRoad[px] = roadAt(px);
+    for (const [step, lines, along] of [[1, size, y => y * size], [size, size, x => x]]) {   // rows, then columns
+      for (let l = 0; l < lines; l++) {
+        const base = along(l), at = k => base + k * step;
+        let k = 0;
+        while (k < size) {
+          if (isRoad[at(k)]) { k++; continue; }
+          let e = k;
+          while (e < size && !isRoad[at(e)]) e++;                     // [k, e) is a stretch without road
+          const gap = e - k;
+          if (k > 0 && e < size && gap <= TUNNEL_GAP) {
+            let before = 0, after = 0;
+            while (before < TUNNEL_RUN && k - 1 - before >= 0 && isRoad[at(k - 1 - before)]) before++;
+            while (after < TUNNEL_RUN && e + after < size && isRoad[at(e + after)]) after++;
+            const ha = hp[at(k - 1) * 4], hb = hp[at(e) * 4];
+            let top = 0;
+            for (let j = k; j < e; j++) top = Math.max(top, hp[at(j) * 4]);
+            if (before >= TUNNEL_RUN && after >= TUNNEL_RUN && Math.abs(ha - hb) <= 2 && top >= Math.max(ha, hb) + 2) {
+              const eff = Math.min(isRoad[at(k - 1)], isRoad[at(e)]);
+              for (let j = k; j < e; j++) { tunnelEff[at(j)] = eff; tunnelH[at(j)] = ha + (hb - ha) * (j - k + 1) / (gap + 1); }
+            }
+          }
+          k = e;
+        }
+      }
+    }
+    for (let px = 0; px < size * size; px++) if (tunnelEff[px]) { nat[px] = 0; pxStep[px] = 0; }
     const hs = new Float32Array(CELL * CELL);
     for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
       let roadEff = 0, surf = 0, land = 0, waterPx = 0, deck = 0, constructed = 0, forest = 0, step = 0, maxStep = 0, k = 0;
       for (let y = 0; y < CELL; y++) for (let x = 0; x < CELL; x++) {
         const px = (r * CELL + y) * size + (c * CELL + x), i = px * 4;
         if (pxStep[px] > maxStep) maxStep = pxStep[px];
-        const rgb = (tp[i] << 16) | (tp[i + 1] << 8) | tp[i + 2], ht = hp[i];
+        const rgb = (tp[i] << 16) | (tp[i + 1] << 8) | tp[i + 2], tunnel = tunnelEff[px] > 0, ht = tunnel ? tunnelH[px] : hp[i];
         hs[k++] = ht;
-        if (x > 0) step += Math.abs(ht - hp[i - 4]);
-        if (y > 0) step += Math.abs(ht - hp[i - size * 4]);
-        const rEff = road.get(rgb), nEff = natural.get(rgb);
-        const isWater = riverbed.has(rgb) || (nEff !== undefined && ht < seaLevel);
+        if (x > 0) step += Math.abs(ht - (tunnelEff[px - 1] ? tunnelH[px - 1] : hp[i - 4]));
+        if (y > 0) step += Math.abs(ht - (tunnelEff[px - size] ? tunnelH[px - size] : hp[i - size * 4]));
+        const rEff = tunnel ? tunnelEff[px] : road.get(rgb), nEff = tunnel ? undefined : natural.get(rgb);
+        const isWater = !tunnel && (riverbed.has(rgb) || (nEff !== undefined && ht < seaLevel));
         if (isWater) { waterPx++; continue; }
         land++;
         if (rEff !== undefined) { roadEff = Math.max(roadEff, rEff); surf += rEff; deck++; }

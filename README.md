@@ -62,7 +62,10 @@ Travel times are routed over the real map (`routing.js`, in a background worker;
 - **Long stretches without a road** are about 10× slower again: farther than half the "Off-road gap" setting (default 80
   blocks) from any road or built-up ground. A short hop between two patches of road costs nothing extra; a route across
   open country only wins when there's no alternative, and the run card flags such a leg.
-- **Not visible from above**: tunnels, and anything under a roof. Shops that can't be reached are left out of runs.
+- **Tunnels and overpasses**: the map shows what's on top, so a road through a tunnel looks cut by a wall. Where a
+  straight road stops for at most 16 blocks under something at least 2 blocks above it, and carries on in the same line
+  on the other side at about the same height, it's assumed to continue underneath. Longer tunnels, and anything under a
+  roof, aren't visible. Shops that can't be reached are left out of runs.
 
 The map shows each leg along its route with its share on roads. Switch "Travel time" to "straight line × road factor"
 for the old estimate. Minutes are still estimates: the speed scale isn't calibrated against real trips yet.
