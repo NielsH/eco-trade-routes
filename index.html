@@ -69,6 +69,18 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .act .qty { font-size: 15px; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
 .act .what { min-width: 0; }
 .act .note { color: var(--side); font-size: 11px; margin-left: 4px; white-space: nowrap; }
+.act .split { display: block; color: var(--side); font-size: 11px; }
+.track { border-bottom: 1px solid var(--line); padding: 10px 14px; background: var(--accent-soft); display: none; }
+.track.on { display: block; }
+.track .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; font-weight: 600; }
+.track .tstop { display: grid; grid-template-columns: 20px 1fr auto; gap: 6px; align-items: start; padding: 3px 0; font-size: 12.5px; }
+.track .tstop .mark { text-align: center; }
+.track .tstop.done { color: var(--muted); }
+.track .tstop .what { color: var(--muted); font-size: 11.5px; }
+.track .warn { color: #d9822b; font-size: 12px; }
+.track .bad { color: var(--bad); font-size: 12px; font-weight: 600; }
+.track .okline { color: var(--good); font-size: 12px; }
+.track button.tiny { padding: 1px 6px; font-size: 11px; }
 .act .price { color: var(--muted); font-size: 11.5px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .drive { color: var(--muted); font-size: 12px; margin-left: 8px; padding: 3px 0 7px 14px; border-left: 3px solid var(--leg, var(--line)); }
 .drive .legtag { color: var(--leg); font-weight: 700; }
@@ -137,6 +149,7 @@ table.offers { width: 100%; border-collapse: collapse; font-size: 12px; margin-t
         <div class="sub" id="cargoNote" style="margin-top:4px"></div>
       </details>
     </div>
+    <div class="track" id="track"></div>
     <div class="tabs" role="tablist">
       <button role="tab" data-tab="runs" aria-selected="true">Runs</button>
       <button role="tab" data-tab="deals" aria-selected="false">Direct deals</button>
@@ -647,7 +660,7 @@ function movedFromAnchor() {
 const PLAYER_POLL_MS = 3000;
 let playerPoll = null;
 async function pollPlayers() {
-  if (document.hidden || PLAYERS == null) return;
+  if ((document.hidden && !TRACK) || PLAYERS == null) return;   // a tracked run follows the player even in the background
   try {
     const r = await getJSON(API + "/players");
     if (!r || !Array.isArray(r.Players)) return;
@@ -655,10 +668,117 @@ async function pollPlayers() {
     PLAYERS = r.Players;
     if (r.Players.map(p => p.Name).sort().join("|") !== before && document.activeElement !== $("player")) fillPlayers();
     renderStart(); draw();
+    if (TRACK) trackProgress();
   } catch (e) { /* keep the last positions; the next poll tries again */ }
 }
 function startPlayerPoll() { clearInterval(playerPoll); playerPoll = setInterval(pollPlayers, PLAYER_POLL_MS); }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollPlayers(); });
+
+// ---------------- tracking a run ----------------
+// "Track this run" pins a snapshot of the run and checks the shops every minute (the server refreshes /shops once a
+// minute) for the stops still ahead: is the shop open, does the seller still have the stock at that price, does the
+// buyer still want the amount, at that price, with the money and room for it. Problems show in the panel and, when
+// allowed, as a desktop notification, so you hear it before the long drive rather than at the counter.
+// Your own trades mustn't look like problems: stops up to the one you're at are skipped. With your player chosen as the
+// start, arriving within STOP_RADIUS blocks of the next stop moves you on; otherwise tick stops off yourself.
+const TRACK_POLL_MS = 60000, STOP_RADIUS = 15;
+let TRACK = store.get("track", null), trackTimer = null;
+function startTracking(r) {
+  const stops = runStops(r).map((s, k) => ({
+    sell: s.sell.map(l => { const o = BYID[r.path[k]].buys.find(b => b.key === l.offer) || {}; return { item: l.item, qty: l.qty, price: l.sell, tag: o.tag ?? null, offerItem: o.item ?? null }; }),
+    buy: s.buy.map(b => ({ item: b.item, qty: b.qty, price: b.buy })),
+  }));
+  TRACK = { path: r.path, names: r.path.map(id => BYID[id].name), pos: r.path.map(id => BYID[id].position), stops,
+    profit: r.profit, currency: S.currency, player: start?.kind === "player" ? start.name : null, at: -1,
+    started: Date.now(), checked: null, dataAt: null, problems: [], told: [] };
+  if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
+  saveTrack(); trackProgress(); checkTrack(); scheduleTrack();
+}
+function stopTracking() { TRACK = null; saveTrack(); clearInterval(trackTimer); trackTimer = null; document.title = "Trade Route Planner"; renderTrack(); }
+function saveTrack() { store.set("track", TRACK); }
+function scheduleTrack() { clearInterval(trackTimer); trackTimer = TRACK ? setInterval(checkTrack, TRACK_POLL_MS) : null; }
+// Stops up to `at` are done (or being done now): not checked any more.
+function setTrackAt(k) { if (!TRACK) return; TRACK.at = Math.max(-1, Math.min(TRACK.path.length - 1, k)); TRACK.problems = TRACK.problems.filter(p => p.stop > TRACK.at); saveTrack(); renderTrack(); }
+function trackProgress() {
+  if (!TRACK || !TRACK.player) return;
+  const me = livePlayer(TRACK.player), next = TRACK.at + 1;
+  if (!me || next >= TRACK.path.length) return;
+  const s = TRACK.pos[next];
+  if (Math.hypot(me.x - s.x, me.z - s.z) <= STOP_RADIUS) setTrackAt(next);
+}
+async function checkTrack() {
+  if (!TRACK) return;
+  let data;
+  try { data = await getJSON(API + "/shops"); } catch (e) { TRACK.error = e.message; renderTrack(); return; }
+  if (!TRACK) return;
+  const byId = Object.fromEntries((data.Shops || []).map(s => [s.Id, s])), problems = [];
+  const say = (stop, level, text) => problems.push({ stop, level, text, key: stop + "|" + text.replace(/[\d.,]+/g, "#") });
+  TRACK.stops.forEach((st, k) => {
+    if (k <= TRACK.at) return;
+    const s = byId[TRACK.path[k]], name = TRACK.names[k];
+    if (!s || s.Error) return say(k, "bad", `${name} isn't in the shop list any more`);
+    if (!s.On || !s.Enabled) return say(k, "bad", `${name} is closed`);
+    for (const b of st.buy) {
+      const o = (s.Sells || []).find(x => x.Item === b.item && x.Price >= 0);
+      if (!o || o.Available <= 0) say(k, "bad", `${name} has no ${pretty(b.item)} left (you need ${fmt(b.qty, 0)})`);
+      else if (o.Available < b.qty) say(k, "warn", `${name} has only ${fmt(o.Available, 0)} of the ${fmt(b.qty, 0)} ${pretty(b.item)}`);
+      if (o && o.Price > b.price + 1e-9) say(k, "warn", `${name} now sells ${pretty(b.item)} at ${fmt(o.Price, 2)} (was ${fmt(b.price, 2)})`);
+    }
+    const offers = new Map();   // our sales per buy offer: an offer's demand is shared by all items it takes
+    for (const l of st.sell) {
+      const key = (l.offerItem || "") + "|" + (l.tag || "");
+      if (!offers.has(key)) offers.set(key, { item: l.offerItem, tag: l.tag, lines: [] });
+      offers.get(key).lines.push(l);
+    }
+    let due = 0;
+    for (const { item, tag, lines } of offers.values()) {
+      const o = (s.Buys || []).find(x => (x.Item ?? null) === item && (x.Tag ?? null) === tag), what = item ? pretty(item) : "any " + tag;
+      const qty = lines.reduce((n, l) => n + l.qty, 0);
+      if (!o) { say(k, "bad", `${name} no longer buys ${what}`); continue; }
+      const take = o.CanAccept ?? Infinity;
+      if (take <= 0) say(k, "bad", `${name} doesn't take any more ${what} (you bring ${fmt(qty, 0)})`);
+      else if (take < qty) say(k, "warn", `${name} now takes only ${fmt(take, 0)} of your ${fmt(qty, 0)} ${what}`);
+      for (const l of lines) {
+        const room = o.CanStoreItems ? o.CanStoreItems[l.item] : null;
+        if (room != null && room < l.qty && take > 0) say(k, room <= 0 ? "bad" : "warn", `${name} has room for ${fmt(room, 0)} of your ${fmt(l.qty, 0)} ${pretty(l.item)}`);
+        if (o.Price < l.price - 1e-9) say(k, "warn", `${name} now pays ${fmt(o.Price, 2)} for ${pretty(l.item)} (was ${fmt(l.price, 2)})`);
+        due += l.qty * Math.min(l.price, o.Price);
+      }
+    }
+    if (due > 0 && !s.UnlimitedBalance && (s.Balance ?? 0) < due - 1e-6) say(k, (s.Balance ?? 0) <= 0 ? "bad" : "warn", `${name} has ${fmt(s.Balance ?? 0)} ${TRACK.currency} left, your sale there is ${fmt(due)}`);
+  });
+  TRACK.error = null; TRACK.problems = problems; TRACK.checked = Date.now(); TRACK.dataAt = data.GeneratedAt;
+  const fresh = problems.filter(p => !TRACK.told.includes(p.key));
+  if (fresh.length && "Notification" in window && Notification.permission === "granted") {
+    try { new Notification(`Trade run: ${fresh.length} problem${fresh.length > 1 ? "s" : ""} ahead`, { body: fresh.map(p => `Stop ${p.stop + 1}: ${p.text}`).join("\n"), tag: "trade-track" }); } catch (e) {}
+  }
+  TRACK.told = [...new Set([...TRACK.told, ...problems.map(p => p.key)])];
+  saveTrack(); renderTrack();
+}
+function renderTrack() {
+  const el = $("track");
+  el.classList.toggle("on", !!TRACK);
+  if (!TRACK) { el.innerHTML = ""; return; }
+  const t = TRACK, bad = t.problems.some(p => p.level === "bad");
+  document.title = (t.problems.length ? (bad ? "⛔ " : "⚠ ") : "") + "Trade Route Planner";
+  const time = ms => new Date(ms).toLocaleTimeString();
+  let html = `<div class="head"><span>Tracking: +${fmt(t.profit)} ${esc(t.currency)}</span><button class="tiny" data-untrack>Stop tracking</button></div>`;
+  html += `<div class="sub">${t.checked ? `Checked ${time(t.checked)}` : "Checking…"} · every minute${t.player ? ` · following ${esc(t.player)}` : " · tick stops off as you go"}</div>`;
+  if (t.error) html += `<div class="warn">Couldn't check: ${esc(t.error)}</div>`;
+  t.path.forEach((id, k) => {
+    const st = t.stops[k], done = k <= t.at, probs = t.problems.filter(p => p.stop === k);
+    const mark = done ? "✓" : probs.some(p => p.level === "bad") ? "⛔" : probs.length ? "⚠" : k === t.at + 1 ? "▶" : "○";
+    const what = [...st.sell.map(l => `sell ${fmt(l.qty, 0)} ${pretty(l.item)}`), ...st.buy.map(b => `buy ${fmt(b.qty, 0)} ${pretty(b.item)}`)].join(", ");
+    html += `<div class="tstop${done ? " done" : ""}"><span class="mark">${mark}</span><span>${k + 1}. ${esc(t.names[k])}<br><span class="what">${esc(what)}</span>` +
+      probs.map(p => `<br><span class="${p.level}">${esc(p.text)}</span>`).join("") + `</span>` +
+      (done ? `<button class="tiny" data-track-at="${k - 1}" title="Not done yet">undo</button>` : `<button class="tiny" data-track-at="${k}" title="I'm done at this stop">✓</button>`) + `</div>`;
+  });
+  if (t.checked && !t.problems.length && t.at < t.path.length - 1) html += `<div class="okline">All trades ahead are still available.</div>`;
+  if (t.at >= t.path.length - 1) html += `<div class="okline">Run done. Use “Continue from ${esc(t.names[t.names.length - 1])}” to plan the next one.</div>`;
+  el.innerHTML = html;
+  el.querySelector("[data-untrack]").onclick = stopTracking;
+  el.querySelectorAll("[data-track-at]").forEach(b => b.onclick = () => setTrackAt(+b.dataset.trackAt));
+}
 
 let replanTimer = null;
 function replan() { clearTimeout(replanTimer); replanTimer = setTimeout(doReplan, 30); }
@@ -1173,7 +1293,8 @@ function render() {
         <div class="path">${r.path.map(shopName).join(" → ")}</div>`;
       if (sel) {
         html += runCard(r);
-        html += `<div class="row"><button class="primary" data-continue="${i}">Continue from ${shopName(r.path[r.path.length - 1])}</button></div>`;
+        html += `<div class="row"><button data-track="${i}" title="Pin this run and check every minute that its shops can still do the trades">Track this run</button>` +
+          `<button class="primary" data-continue="${i}">Continue from ${shopName(r.path[r.path.length - 1])}</button></div>`;
       }
       html += `</div>`;
     });
@@ -1215,8 +1336,10 @@ function render() {
     el.onmouseleave = () => { hoverLeg = null; draw(); };
   });
   hoverLeg = null;
+  list.querySelectorAll("[data-track]").forEach(b => b.onclick = () => startTracking(RUNS[+b.dataset.track]));
   list.querySelectorAll("[data-continue]").forEach(b => b.onclick = async () => {
     const r = RUNS[+b.dataset.continue];
+    if (TRACK) stopTracking();   // the run is done
     recordTrades(r);   // against the numbers this run was planned on, before they're replaced
     if (S.cash !== Infinity) { $("cash").value = Math.floor(S.cash + r.profit); saveForm(); }
     start = { kind: "shop", id: r.path[r.path.length - 1] }; store.set("start", start);
@@ -1226,19 +1349,36 @@ function render() {
   list.querySelectorAll("[data-start]").forEach(b => b.onclick = () => setStart({ kind: "shop", id: b.dataset.start }));
 }
 // A run as instructions: at each stop what to sell and what to buy (quantity first), then the drive to the next stop.
-function runCard(r) {
+// Per stop of a run: what to sell (per buy offer) and what to buy, one line per item with its total and how it splits
+// over the stops it's for (parts), so at the counter you just buy the total.
+function runStops(r) {
   const stops = r.path.map(() => ({ sell: [], buy: [] }));
-  r.legs.forEach((leg, k) => leg.load.forEach(l => { stops[k].buy.push({ ...l, to: k + 1 }); stops[k + 1].sell.push(l); }));
-  r.side.forEach(sd => sd.load.forEach(l => { stops[sd.fromStop].buy.push({ ...l, to: sd.toStop }); stops[sd.toStop].sell.push(l); }));
+  const buy = (k, l, to) => {
+    let m = stops[k].buy.find(b => b.item === l.item);
+    if (!m) stops[k].buy.push(m = { item: l.item, buy: l.buy, unknown: l.unknown, qty: 0, parts: [] });
+    m.qty += l.qty; m.parts.push({ qty: l.qty, to, viaTag: l.viaTag });
+  };
+  r.legs.forEach((leg, k) => leg.load.forEach(l => { buy(k, l, k + 1); stops[k + 1].sell.push(l); }));
+  r.side.forEach(sd => sd.load.forEach(l => { buy(sd.fromStop, l, sd.toStop); stops[sd.toStop].sell.push(l); }));
+  for (const s of stops) for (const b of s.buy) b.parts.sort((x, y) => x.to - y.to);
+  return stops;
+}
+function runCard(r) {
+  const stops = runStops(r);
   let bal = 0, need = 0;   // cash needed up front: sales at a stop come before its purchases
   for (const s of stops) { for (const l of s.sell) bal += l.qty * l.sell * (1 + S.bonus); for (const l of s.buy) bal -= l.qty * l.buy; need = Math.max(need, -bal); }
   const line = (verb, l, k) => {
     const price = verb === "buy" ? l.buy : l.sell, notes = [];
-    if (l.viaTag) notes.push("as " + esc(l.viaTag));
-    if (verb === "buy" && l.to > k + 1) notes.push("for stop " + (l.to + 1));
+    let split = "";
+    if (verb === "sell" && l.viaTag) notes.push("as " + esc(l.viaTag));
+    if (verb === "buy") {
+      const part = p => (p.to > k + 1 ? "for stop " + (p.to + 1) : "for the next stop") + (p.viaTag ? " as " + esc(p.viaTag) : "");
+      if (l.parts.length > 1) split = `<span class="split">${l.parts.map(p => `${fmt(p.qty, 0)} ${part(p)}`).join(" · ")}</span>`;
+      else if (l.parts[0].to > k + 1 || l.parts[0].viaTag) notes.push(part(l.parts[0]).replace("for the next stop as", "as"));
+    }
     if (l.unknown) notes.push("⚠ no item data");
     return `<div class="act ${verb}"><span class="verb">${verb}</span><span class="qty">${fmt(l.qty, 0)}</span>` +
-      `<span class="what">${esc(pretty(l.item))}${notes.map(n => `<span class="note">${n}</span>`).join("")}</span>` +
+      `<span class="what">${esc(pretty(l.item))}${notes.map(n => `<span class="note">${n}</span>`).join("")}${split}</span>` +
       `<span class="price">${fmt(price, 2)} ea · ${fmt(l.qty * price)}</span></div>`;
   };
   const roadText = (a, b) => {
@@ -1276,6 +1416,7 @@ initForm();
 new ResizeObserver(resize).observe(cv);
 loadMap(); load();
 startPlayerPoll();
+if (TRACK) { renderTrack(); checkTrack(); scheduleTrack(); }
 $("refresh").addEventListener("click", loadMap);
 </script>
 </body>

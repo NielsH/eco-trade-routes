@@ -31,6 +31,11 @@ point it elsewhere with `?server=https://your.server`.
 - **Storage space** at a buyer: the server's dry run of each delivery (per item, also for tag offers like "any Wood"),
   plus the store's free slots shared by everything one run sells there. A store whose storage only takes non-carried
   items gets no logs, whatever its offer says.
+- **Track this run** pins the run above the list and checks its shops every minute: for the stops still ahead, is the
+  shop open, does the seller still have the stock at that price, does the buyer still want your amount at that price,
+  with the money and room for it. Problems show in the panel, in the tab title and (if you allow it) as a desktop
+  notification. Stops you've done are skipped so your own trades don't count: with your player as the start, reaching
+  the next stop ticks it off; otherwise tick stops off yourself.
 - **Continue from <last stop>** plans the next run from where this one ends, assuming its trades happened.
   **Refresh** reloads the real state.
 - **Vehicle**: your own placed vehicles (when you picked your player), every vehicle type placed on the server, and a
