@@ -229,14 +229,22 @@ async function load() {
         for (const type of tagIndex[norm(t)]) (ITEMS[type].tags ||= []).push(t);   // items get their tags from the same data
       }
     }
+    // Eco 0.14.2 store fields (RecipeApi 1.1), all absent on older servers and defaulting to how those behave: HasPrice false =
+    // not priced yet, the server refuses the trade; MinimumBalance = a floor buy offers never pay below, so `balance` here is what
+    // the store can spend; DiscountTiers = quantity discounts on sell offers. noCap: no figure caps a buy offer at all (the old
+    // "999 and no limit" test, which a 0.14.2 "no limit" of -1 no longer passes).
     SHOPS = shops.Shops.filter(s => !s.Error).map(s => ({
       id: s.Id, name: clean(s.Name), owner: s.Owner, x: s.Position.X, z: s.Position.Z, position: { x: s.Position.X, z: s.Position.Z },
-      on: s.On, enabled: s.Enabled, currency: s.Currency, balance: s.UnlimitedBalance ? "infinite" : s.Balance, emptySlots: s.EmptySlots,
-      sells: s.Sells.map((o, n) => ({ key: `${s.Id}/s${n}`, item: o.Item, tag: o.Tag, price: o.Price, quantity: o.Available, limit: o.Limit })),
+      on: s.On, enabled: s.Enabled, currency: s.Currency, emptySlots: s.EmptySlots,
+      balance: s.UnlimitedBalance ? "infinite" : s.Balance == null ? s.Balance : Math.max(0, s.Balance - (s.MinimumBalance || 0)),
+      minBalance: s.MinimumBalance || 0,
+      sells: s.Sells.map((o, n) => ({ key: `${s.Id}/s${n}`, item: o.Item, tag: o.Tag, price: o.Price, limit: o.Limit, hasPrice: o.HasPrice !== false,
+        quantity: o.HasPrice === false ? 0 : o.Available, tiers: o.DiscountTiers || [] })),
       buys: s.Buys.map((o, n) => ({
-        key: `${s.Id}/b${n}`, item: o.Item, tag: o.Tag, price: o.Price, limit: o.Limit,
+        key: `${s.Id}/b${n}`, item: o.Item, tag: o.Tag, price: o.Price, limit: o.Limit, hasPrice: o.HasPrice !== false, limitMode: o.LimitMode || null,
         tagItems: o.Item ? null : (tagIndex[norm(o.Tag)] || []),
-        quantity: o.CanAccept ?? 999, unlimited: o.Wanted == null, wanted: o.Wanted, canAfford: o.CanAfford, canStore: o.CanStore, canStoreItems: o.CanStoreItems || null,
+        quantity: o.HasPrice === false ? 0 : o.CanAccept ?? 999, noCap: o.HasPrice !== false && o.CanAccept == null,
+        unlimited: o.Wanted == null, wanted: o.Wanted, canAfford: o.CanAfford, canStore: o.CanStore, canStoreItems: o.CanStoreItems || null,
       })),
     }));
     BYID = Object.fromEntries(SHOPS.map(s => [s.id, s]));
@@ -264,7 +272,7 @@ function recordTrades(r) {
     TRADES.sells[sk] ||= { shop: leg.from, item: l.item, qty: 0, before: so ? so.quantity : 0, at: now };
     TRADES.sells[sk].qty += l.qty;
     const bo = BYID[leg.to].buys.find(o => o.key === l.offer);
-    if (bo && !(bo.quantity === 999 && !bo.limit)) {   // an offer without a limit has no demand to use up
+    if (bo && !bo.noCap) {   // an offer without a limit has no demand to use up
       TRADES.buys[l.offer] ||= { shop: leg.to, key: l.offer, item: bo.item, tag: bo.tag, qty: 0, before: bo.quantity, at: now };
       TRADES.buys[l.offer].qty += l.qty;
     }
@@ -381,6 +389,11 @@ function stackOf(name) {
   return Math.min(CARGO.storages.length ? per(takerOf(name)) : it.stackSize, CARGO.boat?.length ? per(boatTakerOf(name)) : Infinity);
 }
 const mod = (a, n) => ((a % n) + n) % n;
+// Quantity discounts (Eco 0.14.2 sell offers, TradePricingUtils): the best tier one trade's quantity reaches takes its percent
+// off the whole line; never on a price of 0 or less. Without tiers (older servers) a line costs price x quantity.
+const discountFor = (so, q) => so.price > 0 ? Math.max(0, ...(so.tiers || []).filter(t => q >= t.MinQuantity).map(t => t.DiscountPercent)) : 0;
+const lineCost = (so, q) => q * so.price * (1 - discountFor(so, q) / 100);
+const bestPrice = so => so.price > 0 ? so.price * (1 - Math.max(0, ...(so.tiers || []).map(t => t.DiscountPercent)) / 100) : so.price;
 
 function buildMarket() {
   const open = SHOPS.filter(s => s.on && s.enabled && s.currency && s.currency === S.currency);
@@ -396,8 +409,10 @@ function buildMarket() {
       for (const name of bo.item ? [bo.item] : (bo.tagItems || [])) {   // a tag offer takes any item in its tag, sharing one limit
         const so = sells[X.id][name];
         if (!so || !fits(name)) continue;
-        const unit = bo.price * (1 + S.bonus) - so.price;
-        if (unit > 0) m.push({ name, so, bo, unit });
+        // unit ranks the candidate: the margin at the list price, or at the best discount for a deal that only pays with one
+        // (each lot is then priced by its real quantity and dropped if that doesn't reach the tier).
+        const unit = bo.price * (1 + S.bonus) - so.price, best = bo.price * (1 + S.bonus) - bestPrice(so);
+        if (best > 0) m.push({ name, so, bo, unit: unit > 0 ? unit : best });
       }
     }
     if (m.length) { pairs.set(X.id + "|" + Y.id, m); (out[X.id] ||= []).push(Y.id); }
@@ -459,23 +474,25 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
     const it = itemInfo(name);
     const avail = so.quantity - (st.sold[X + "|" + name] || 0) - (used[name] || 0);
     let want = bo.quantity - (st.bought[bo.key] || 0) - (taken[bo.key] || 0);
-    if (bo.quantity === 999 && !bo.limit) want = Infinity;
+    if (bo.noCap) want = Infinity;
     let q = Math.min(avail, want);
     if (q <= 0) continue;
     const stack = stackOf(name);
     const roomSlots = (slotsLeft - usedSlots) * stack + (partial[name] || 0);
     const roomW = it.weightKg > 0 ? Math.floor((weightLeft - usedW) / it.weightKg) : Infinity;
-    const afford = so.price > 0 ? Math.floor((cash - cost) / so.price) : Infinity;
+    const afford = so.price > 0 ? Math.floor((cash - cost) / so.price) : Infinity;   // at the list price: a discount only lowers it
     const payable = bo.price > 0 ? Math.floor((yMoney - revenue) / bo.price) : Infinity;
     q = Math.floor(Math.min(q, roomSlots, roomW, afford, payable, storeRoom(Y, name, stored, bo)));
     if (!(q > 0)) continue;
+    const lotCost = lineCost(so, q), lotRevenue = q * bo.price * (1 + S.bonus);
+    if (lotRevenue - lotCost <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
     stored[name] = (stored[name] || 0) + q;
     const newTotal = q - (partial[name] || 0);
     usedSlots += Math.max(0, Math.ceil(newTotal / stack));
     partial[name] = mod(-newTotal, stack);
-    usedW += q * it.weightKg; cost += q * so.price; revenue += q * bo.price * (1 + S.bonus);
+    usedW += q * it.weightKg; cost += lotCost; revenue += lotRevenue;
     taken[bo.key] = (taken[bo.key] || 0) + q; used[name] = (used[name] || 0) + q;
-    load.push({ item: name, qty: q, buy: so.price, sell: bo.price, profit: q * unit, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown });
+    load.push({ item: name, qty: q, buy: lotCost / q, list: so.price, sellKey: so.key, sell: bo.price, profit: lotRevenue - lotCost, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown });
   }
   return { load, slots: usedSlots, w: usedW, cost, revenue };
 }
@@ -561,10 +578,10 @@ function packRun(run) {
   const cash = new Array(L).fill(S.cash);   // cash in hand when leaving stop k, after its buys
   const sold = {}, bought = {}, paid = {}, picks = [], stored = {};
   const storedAt = Y => stored[Y] ||= { ...DONE.stored[Y] };
-  for (const { i, j, name, so, bo, unit } of lots) {
+  for (const { i, j, name, so, bo } of lots) {
     const X = path[i], Y = path[j], it = itemInfo(name), stack = stackOf(name), Ys = BYID[Y];
     let q = so.quantity - (DONE.sold[X + "|" + name] || 0) - (sold[X + "|" + name] || 0);
-    if (!(bo.quantity === 999 && !bo.limit)) q = Math.min(q, bo.quantity - (DONE.bought[bo.key] || 0) - (bought[bo.key] || 0));
+    if (!bo.noCap) q = Math.min(q, bo.quantity - (DONE.bought[bo.key] || 0) - (bought[bo.key] || 0));
     if (Ys.balance !== "infinite" && bo.price > 0) q = Math.min(q, Math.floor(((Ys.balance || 0) - (DONE.money[Y] || 0) - (paid[Y] || 0)) / bo.price));
     q = Math.min(q, storeRoom(Y, name, storedAt(Y), bo));
     for (let k = i; k < j; k++) {
@@ -574,7 +591,8 @@ function packRun(run) {
     }
     q = Math.floor(q);
     if (!(q > 0)) continue;
-    const cost = q * so.price, revenue = q * bo.price * (1 + S.bonus);
+    const cost = lineCost(so, q), revenue = q * bo.price * (1 + S.bonus);
+    if (revenue - cost <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
     for (let k = i; k < j; k++) {
       const added = q - (partial[k][name] || 0);
       slots[k] += Math.max(0, Math.ceil(added / stack)); partial[k][name] = mod(-added, stack);
@@ -583,7 +601,7 @@ function packRun(run) {
     for (let k = j; k < L; k++) cash[k] += revenue - cost;
     sold[X + "|" + name] = (sold[X + "|" + name] || 0) + q; bought[bo.key] = (bought[bo.key] || 0) + q; paid[Y] = (paid[Y] || 0) + q * bo.price;
     storedAt(Y)[name] = (storedAt(Y)[name] || 0) + q;
-    picks.push({ i, j, cost, revenue, line: { item: name, qty: q, buy: so.price, sell: bo.price, profit: q * unit, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown } });
+    picks.push({ i, j, cost, revenue, line: { item: name, qty: q, buy: cost / q, list: so.price, sellKey: so.key, sell: bo.price, profit: revenue - cost, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown } });
   }
   const legs = run.legs.map((l, k) => {
     const own = picks.filter(p => p.i === k && p.j === k + 1);
@@ -604,6 +622,27 @@ function bestPacking(run) {
   const old = sideDeals(run), packed = packRun(run);
   return packed.profit > old.profit + 1e-6 ? packed : old;
 }
+// In game, all of one item bought at a stop is a single trade, so its quantity discount is the one their total reaches.
+// Packing priced each lot on its own (never cheaper than this); the merged price replaces it and the saving is profit.
+// Lines are copied first: runs share leg loads with their beam ancestors.
+function stopDiscounts(run) {
+  run.legs = run.legs.map(leg => ({ ...leg, load: leg.load.map(l => ({ ...l })) }));
+  run.side = run.side.map(sd => ({ ...sd, load: sd.load.map(l => ({ ...l })) }));
+  const groups = new Map();
+  const add = (k, l, holder) => { const key = k + "|" + l.item; if (!groups.has(key)) groups.set(key, { k, lines: [] }); groups.get(key).lines.push({ l, holder }); };
+  run.legs.forEach((leg, k) => leg.load.forEach(l => add(k, l, leg)));
+  run.side.forEach(sd => sd.load.forEach(l => add(sd.fromStop, l, sd)));
+  for (const { k, lines } of groups.values()) {
+    const so = BYID[run.path[k]].sells.find(o => o.key === lines[0].l.sellKey);
+    if (!so || !so.tiers.length) continue;
+    const q = lines.reduce((n, x) => n + x.l.qty, 0), merged = lineCost(so, q);
+    const before = lines.reduce((n, x) => n + x.l.qty * x.l.buy, 0);
+    if (before - merged < 1e-9) continue;
+    for (const { l, holder } of lines) { const d = l.qty * (l.buy - merged / q); holder.cost -= d; l.profit += d; l.buy = merged / q; }
+    run.profit += before - merged;
+  }
+  return run;
+}
 
 function directDeals(startPos) {
   const deals = [];
@@ -611,19 +650,21 @@ function directDeals(startPos) {
     const [X, Y] = k.split("|"), A = M.byId[X], B = M.byId[Y];
     const lead = startPos ? leadMinutes(startPos, X) : 0, leg = legMinutes(X, Y) + S.stopMinutes;
     if (!isFinite(lead) || !isFinite(leg)) continue;
-    for (const { name, so, bo, unit } of cands) {
+    for (const { name, so, bo } of cands) {
       const it = itemInfo(name);
       const cap = Math.min(S.slots * stackOf(name), it.weightKg > 0 ? Math.floor(S.maxWeightKg / it.weightKg) : Infinity);
       const limits = { "A stock": so.quantity - (DONE.sold[X + "|" + name] || 0),
-        "B wants": bo.quantity === 999 && !bo.limit ? Infinity : bo.quantity - (DONE.bought[bo.key] || 0),
+        "B wants": bo.noCap ? Infinity : bo.quantity - (DONE.bought[bo.key] || 0),
         "B money": B.balance === "infinite" ? Infinity : Math.floor(((B.balance || 0) - (DONE.money[Y] || 0)) / bo.price),
         "B storage": storeRoom(Y, name, DONE.stored[Y], bo),
         "your cash": so.price > 0 ? Math.floor(S.cash / so.price) : Infinity, "vehicle": cap };
       const q = Math.min(...Object.values(limits));
       if (!(q > 0)) continue;
+      const cost = lineCost(so, q), profit = q * bo.price * (1 + S.bonus) - cost;
+      if (profit <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
       const mins = lead + S.stopMinutes + leg;
-      deals.push({ X, Y, name, q, unit, profit: q * unit, mins, rate: q * unit / mins, viaTag: bo.item ? null : bo.tag,
-        buy: so.price, sell: bo.price, limitedBy: Object.keys(limits).find(k => limits[k] === q), lead });
+      deals.push({ X, Y, name, q, unit: profit / q, profit, mins, rate: profit / mins, viaTag: bo.item ? null : bo.tag,
+        buy: cost / q, list: so.price, sell: bo.price, limitedBy: Object.keys(limits).find(k => limits[k] === q), lead });
     }
   }
   return deals.sort((a, b) => b.rate - a.rate).slice(0, 200);
@@ -686,7 +727,7 @@ let TRACK = store.get("track", null), trackTimer = null;
 function startTracking(r) {
   const stops = runStops(r).map((s, k) => ({
     sell: s.sell.map(l => { const o = BYID[r.path[k]].buys.find(b => b.key === l.offer) || {}; return { item: l.item, qty: l.qty, price: l.sell, tag: o.tag ?? null, offerItem: o.item ?? null }; }),
-    buy: s.buy.map(b => ({ item: b.item, qty: b.qty, price: b.buy })),
+    buy: s.buy.map(b => ({ item: b.item, qty: b.qty, price: b.list ?? b.buy })),   // the list price: what the shop shows and may change
   }));
   TRACK = { path: r.path, names: r.path.map(id => BYID[id].name), pos: r.path.map(id => BYID[id].position), stops,
     profit: r.profit, currency: S.currency, player: start?.kind === "player" ? start.name : null, at: -1,
@@ -720,6 +761,7 @@ async function checkTrack() {
     if (!s.On || !s.Enabled) return say(k, "bad", `${name} is closed`);
     for (const b of st.buy) {
       const o = (s.Sells || []).find(x => x.Item === b.item && x.Price >= 0);
+      if (o && o.HasPrice === false) { say(k, "bad", `${name} has taken the price off ${pretty(b.item)}: it can't be bought`); continue; }
       if (!o || o.Available <= 0) say(k, "bad", `${name} has no ${pretty(b.item)} left (you need ${fmt(b.qty, 0)})`);
       else if (o.Available < b.qty) say(k, "warn", `${name} has only ${fmt(o.Available, 0)} of the ${fmt(b.qty, 0)} ${pretty(b.item)}`);
       if (o && o.Price > b.price + 1e-9) say(k, "warn", `${name} now sells ${pretty(b.item)} at ${fmt(o.Price, 2)} (was ${fmt(b.price, 2)})`);
@@ -735,6 +777,7 @@ async function checkTrack() {
       const o = (s.Buys || []).find(x => (x.Item ?? null) === item && (x.Tag ?? null) === tag), what = item ? pretty(item) : "any " + tag;
       const qty = lines.reduce((n, l) => n + l.qty, 0);
       if (!o) { say(k, "bad", `${name} no longer buys ${what}`); continue; }
+      if (o.HasPrice === false) { say(k, "bad", `${name} has taken the price off ${what}: it can't be sold there`); continue; }
       const take = o.CanAccept ?? Infinity;
       if (take <= 0) say(k, "bad", `${name} doesn't take any more ${what} (you bring ${fmt(qty, 0)})`);
       else if (take < qty) say(k, "warn", `${name} now takes only ${fmt(take, 0)} of your ${fmt(qty, 0)} ${what}`);
@@ -745,7 +788,8 @@ async function checkTrack() {
         due += l.qty * Math.min(l.price, o.Price);
       }
     }
-    if (due > 0 && !s.UnlimitedBalance && (s.Balance ?? 0) < due - 1e-6) say(k, (s.Balance ?? 0) <= 0 ? "bad" : "warn", `${name} has ${fmt(s.Balance ?? 0)} ${TRACK.currency} left, your sale there is ${fmt(due)}`);
+    const spendable = Math.max(0, (s.Balance ?? 0) - (s.MinimumBalance || 0));   // buy offers never pay below the owner's floor (0.14.2)
+    if (due > 0 && !s.UnlimitedBalance && spendable < due - 1e-6) say(k, spendable <= 0 ? "bad" : "warn", `${name} has ${fmt(spendable)} ${TRACK.currency} left to spend, your sale there is ${fmt(due)}`);
   });
   TRACK.error = null; TRACK.problems = problems; TRACK.checked = Date.now(); TRACK.dataAt = data.GeneratedAt;
   const fresh = problems.filter(p => !TRACK.told.includes(p.key));
@@ -796,7 +840,7 @@ function doReplan() {
   const runs = plan(sp).filter(r => r.legs.length >= S.minLegs);
   runs.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
   const seen = new Set(); RUNS = [];
-  for (const r of runs) { const k = r.path.join(">"); if (seen.has(k)) continue; seen.add(k); RUNS.push(bestPacking(r)); if (RUNS.length >= 120) break; }
+  for (const r of runs) { const k = r.path.join(">"); if (seen.has(k)) continue; seen.add(k); RUNS.push(stopDiscounts(bestPacking(r))); if (RUNS.length >= 120) break; }
   RUNS.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);   // packing can lift a run, so re-rank before cutting
   RUNS = RUNS.slice(0, 40);
   DEALS = directDeals(sp);
@@ -1355,7 +1399,7 @@ function runStops(r) {
   const stops = r.path.map(() => ({ sell: [], buy: [] }));
   const buy = (k, l, to) => {
     let m = stops[k].buy.find(b => b.item === l.item);
-    if (!m) stops[k].buy.push(m = { item: l.item, buy: l.buy, unknown: l.unknown, qty: 0, parts: [] });
+    if (!m) stops[k].buy.push(m = { item: l.item, buy: l.buy, list: l.list ?? l.buy, unknown: l.unknown, qty: 0, parts: [] });
     m.qty += l.qty; m.parts.push({ qty: l.qty, to, viaTag: l.viaTag });
   };
   r.legs.forEach((leg, k) => leg.load.forEach(l => { buy(k, l, k + 1); stops[k + 1].sell.push(l); }));
@@ -1376,6 +1420,7 @@ function runCard(r) {
       if (l.parts.length > 1) split = `<span class="split">${l.parts.map(p => `${fmt(p.qty, 0)} ${part(p)}`).join(" · ")}</span>`;
       else if (l.parts[0].to > k + 1 || l.parts[0].viaTag) notes.push(part(l.parts[0]).replace("for the next stop as", "as"));
     }
+    if (verb === "buy" && l.list > l.buy + 1e-9) notes.push(`−${fmt(100 * (1 - l.buy / l.list), 0)}% for ${fmt(l.qty, 0)} (list ${fmt(l.list, 2)})`);
     if (l.unknown) notes.push("⚠ no item data");
     return `<div class="act ${verb}"><span class="verb">${verb}</span><span class="qty">${fmt(l.qty, 0)}</span>` +
       `<span class="what">${esc(pretty(l.item))}${notes.map(n => `<span class="note">${n}</span>`).join("")}${split}</span>` +
@@ -1400,10 +1445,12 @@ function runCard(r) {
   return html;
 }
 function shopDetail(s) {
-  const rows = (offers, buy) => offers.map(o => `<tr><td>${esc(pretty(o.item) || ("any " + o.tag))}</td><td class="num">${fmt(o.price, 2)}</td>
-    <td class="num">${buy ? (o.quantity === 999 && o.unlimited ? "any" : fmt(o.quantity, 0)) : fmt(o.quantity, 0)}</td></tr>`).join("");
+  const tiers = o => o.tiers?.length && o.price > 0 ? `<span class="note">${o.tiers.map(t => `−${fmt(t.DiscountPercent, 0)}% at ${fmt(t.MinQuantity, 0)}+`).join(" · ")}</span>` : "";
+  const rows = (offers, buy) => offers.map(o => `<tr><td>${esc(pretty(o.item) || ("any " + o.tag))}${buy ? "" : tiers(o)}</td>
+    <td class="num">${o.hasPrice ? fmt(o.price, 2) : "no price"}</td>
+    <td class="num">${buy ? (o.noCap ? "any" : fmt(o.quantity, 0)) : fmt(o.quantity, 0)}</td></tr>`).join("");
   return `<div class="detail"><h2>${esc(s.name)}</h2>
-    <div class="sub">${esc(s.owner)} · ${s.on && s.enabled ? "open" : "closed"} · ${esc(s.currency || "barter")} · money ${s.balance === "infinite" ? "∞" : fmt(s.balance ?? 0)} · x ${Math.round(s.x)}, z ${Math.round(s.z)}</div>
+    <div class="sub">${esc(s.owner)} · ${s.on && s.enabled ? "open" : "closed"} · ${esc(s.currency || "barter")} · money ${s.balance === "infinite" ? "∞" : fmt(s.balance ?? 0)}${s.minBalance > 0 ? ` (keeps ${fmt(s.minBalance)})` : ""} · x ${Math.round(s.x)}, z ${Math.round(s.z)}</div>
     ${s.emptySlots ? `<div class="sub">Empty storage slots: ${s.emptySlots.Carried} for carried items (logs, lumber, …) · ${s.emptySlots.NonCarried} for other items · ${s.emptySlots.Either} for either</div>` : ""}
     <div class="row" style="margin-top:6px"><button class="primary" data-start="${s.id}">Start here</button></div>
     <table class="offers"><tr><th>Sells</th><th class="num">price</th><th class="num">stock</th></tr>${rows(s.sells, false) || '<tr><td colspan="3">—</td></tr>'}</table>

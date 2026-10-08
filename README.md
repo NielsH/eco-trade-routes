@@ -49,6 +49,24 @@ point it elsewhere with `?server=https://your.server`.
 - **Settings**: vehicle slots, max kg and speed (editable), cash limit, legs, currency, time per stop, road
   factor (road distance / straight line) and a sale bonus %.
 
+## Eco 0.14.1 and 0.14.2
+
+The page and tools work with servers on either version. The Eco 0.14.2 store features are used when the server's
+EcoRecipeApi reports them (version 1.1 and later); without them everything behaves as on 0.14.1:
+
+- **Unpriced offers** (added in the store UI, no price set yet) can't be traded, so they are left out. The shop panel
+  shows them as "no price".
+- **Minimum balance**: a store owner can keep a floor on the account that buy offers never pay below. The money a
+  buyer has for you is the balance above that floor; the shop panel shows "money 100 (keeps 400)".
+- **Quantity discounts** on sell offers: the best tier a trade's quantity reaches takes its percent off the whole line.
+  Each purchase is priced at its real quantity, so a deal that only pays at a discount is planned only when the run
+  buys enough to reach it. In game, all of one item bought at a stop is one trade, so a run's purchases there are
+  priced together; the run card shows the discount and the list price.
+- **One-time buy quotas** and **"no limit"** buy offers (`Limit` -1 on 0.14.2, 0 on 0.14.1) are read from the server's
+  own `Wanted` figure, which means the same on both.
+
+`find_routes.py` prices at the list price (no discounts), which can only understate a deal.
+
 ## Routing
 
 Travel times are routed over the real map (`routing.js`, in a background worker; about a second for 100 shops):
@@ -87,4 +105,4 @@ from the repo root; they read and write `data/` (git-ignored).
 | `find_routes.py` | direct A→B deals |
 | `build_terrain_colors.py` | regenerate `terrain-colors.js` (what each map colour means for driving) from an Eco source checkout: `--eco <Eco>/Server` |
 | `build_catalog.py` | regenerate `vehicles.js` (and `data/items.json`) from an Eco source checkout: `--eco <Eco>/Server [--server <server>/Mods/UserCode]` |
-| `extract_shops.py` | shops from a save file (`Game.eco`) instead of the API; needs a sibling clone of [eco-save-reader](https://github.com/NielsH/eco-save-reader) |
+| `extract_shops.py` | shops from a save file (`Game.eco`) instead of the API; needs a sibling clone of [eco-save-reader](https://github.com/NielsH/eco-save-reader). Reads 0.14.1 and 0.14.2 saves (it tells them apart by the offer fields 0.14.2 added) |

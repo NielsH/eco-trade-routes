@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "eco-save-reader"))  # sibling clone of NielsH/eco-save-reader
 from ecosave import SaveFile  # noqa: E402
+from pricing import clean_tiers  # noqa: E402
 
 
 def type_name(t):
@@ -36,19 +37,33 @@ def offer_json(o):
     item = (o.get("Stack") or {}).get("Item")
     qty = (o.get("Stack") or {}).get("Quantity", 0)
     buying = bool(o.get("Buying"))
-    return {
+    # Saves written by Eco 0.14.2+ carry HasPrice and LimitMode on every offer; 0.14.1 saves have neither. The buy Limit
+    # changed meaning with them: "no limit" was 0 and is -1 now (0 = wants none; the 0.14.2 migration converts old saves).
+    new_format = "HasPrice" in o or "LimitMode" in o
+    has_price = o.get("HasPrice", True)  # False: not priced yet, the server refuses the trade
+    limit = o.get("Limit", 0) or 0
+    unlimited = buying and (limit < 0 if new_format else limit == 0)
+    out = {
         "item": type_name(item["$type"]) if isinstance(item, dict) and "$type" in item else None,
         "tag": (tag.get("Name") or tag.get("name") or type_name(tag.get("$type", ""))) if isinstance(tag, dict) else None,
         "price": round(float(o.get("Price") or 0), 4),
-        # Store caches these on every stock change (StoreComponent.UpdateStock):
+        "hasPrice": has_price,
+        # Store caches these on every stock change (StoreComponent.UpdateStock), already folding in the 0.14.2 reserve-all
+        # (-1) and one-time quotas, but not HasPrice, so an unpriced offer counts as 0 here:
         #   selling: units available to customers (stock minus Limit, which is a keep-in-reserve)
-        #   buying : units it still wants (Limit minus stock), 999 when unlimited
-        "quantity": qty,
-        "limit": o.get("Limit", 0),
-        "unlimited": buying and not o.get("Limit"),
+        #   buying : units it still wants (Limit minus stock, or what is left of a quota), 999 when unlimited
+        "quantity": qty if has_price else 0,
+        "limit": limit,
+        "unlimited": unlimited,
+        "noCap": unlimited and has_price,
         "minDurability": o.get("MinDurability"),
         "minIntegrity": o.get("MinIntegrity"),
     }
+    if buying:
+        out["limitMode"] = o.get("LimitMode", "AvailableQuantity")
+    else:
+        out["discountTiers"] = clean_tiers(o.get("DiscountTiers"))
+    return out
 
 
 def main(save_path, out_path):
@@ -80,8 +95,11 @@ def main(save_path, out_path):
                 for h in acc.get("CurrencyHoldings") or []:
                     if ref_id(h["key"]) == cur_id:
                         balance = h["value"].get("val")
+            minimum = float(store.get("minimumBalance") or 0)  # 0.14.2: buy offers never pay out below this floor
             if isinstance(balance, float) and balance == float("inf"):
                 balance = "infinite"  # issuer's own credit currency
+            elif balance is not None:
+                balance = max(0.0, balance - minimum)  # what buy offers can still pay out
 
             data = store.get("StoreData") or {}
             sells, buys = [], []
@@ -116,6 +134,7 @@ def main(save_path, out_path):
                 "currency": currencies[cur_id]["Name"] if cur_id in currencies else None,  # None = barter
                 "bankAccount": acc.get("Name") if acc else None,
                 "balance": balance,
+                "minimumBalance": minimum,
                 "sells": sells,
                 "buys": buys,
                 "links": links,

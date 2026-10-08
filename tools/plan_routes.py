@@ -18,6 +18,8 @@ import math
 import os
 import re
 
+from pricing import best_price, line_cost
+
 clean = lambda s: re.sub(r"<[^>]+>", "", s or "").strip()
 
 
@@ -51,9 +53,12 @@ class Market:
                     for name in [bo["item"]] if bo["item"] else bo.get("tagItems") or []:
                         so = sells[X["id"]].get(name)
                         if so:
+                            # Ranked by the margin at the list price, or at the best discount for a deal that only pays
+                            # with one; fill() prices each lot by its real quantity and drops it if the tier isn't reached.
                             unit = bo["price"] * (1 + a.bonus) - so["price"]
-                            if unit > 0:
-                                m.append((name, so, bo, unit))
+                            best = bo["price"] * (1 + a.bonus) - best_price(so)
+                            if best > 0:
+                                m.append((name, so, bo, unit if unit > 0 else best))
                 if m:
                     self.pairs[(X["id"], Y["id"])] = m
         self.out = {}
@@ -85,7 +90,7 @@ class Market:
             key = offer_key(Y, bo)
             avail = so["quantity"] - st["sold"].get((X, name), 0) - used.get(name, 0)
             want = bo["quantity"] - st["bought"].get(key, 0) - taken.get(key, 0)
-            if bo["quantity"] == 999 and not bo["limit"]:
+            if bo.get("noCap", bo["quantity"] == 999 and not bo["limit"]):  # older shops.json files have no noCap
                 want = math.inf
             q = min(avail, want)
             if q <= 0:
@@ -97,15 +102,18 @@ class Market:
             q = int(min(q, room_slots, room_w, afford, payable))
             if q <= 0:
                 continue
+            lot_cost, lot_revenue = line_cost(so, q), q * bo["price"] * (1 + self.a.bonus)
+            if lot_revenue - lot_cost <= 1e-9:
+                continue  # only pays at a discount this quantity doesn't reach
             new_total = q - partial.get(name, 0)
             used_slots += max(0, math.ceil(new_total / it["stackSize"]))
             partial[name] = (-new_total) % it["stackSize"]
             used_w += q * it["weightKg"]
-            cost += q * so["price"]
-            revenue += q * bo["price"] * (1 + self.a.bonus)
+            cost += lot_cost
+            revenue += lot_revenue
             taken[key] = taken.get(key, 0) + q
             used[name] = used.get(name, 0) + q
-            load.append({"item": name, "qty": q, "buy": so["price"], "sell": bo["price"], "profit": round(q * unit, 2),
+            load.append({"item": name, "qty": q, "buy": round(lot_cost / q, 4), "list": so["price"], "sell": bo["price"], "profit": round(lot_revenue - lot_cost, 2),
                          "offer": key, "viaTag": None if bo["item"] else bo.get("tag"), "unknownItem": bool(it.get("unknown"))})
         return load, used_slots, used_w, cost, revenue
 
