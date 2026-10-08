@@ -11,6 +11,12 @@ import json
 import os
 import urllib.request
 
+from pricing import clean_tiers
+
+
+def spendable(balance, minimum):
+    return None if balance is None else max(0.0, balance - (minimum or 0))
+
 
 def norm(tag):
     return (tag or "").replace(" ", "").lower()
@@ -42,22 +48,29 @@ def get(url):
 
 
 def offer(o, buying, key, tags):
+    # Eco 0.14.2 (RecipeApi 1.1): HasPrice false = not priced yet, the server refuses the trade, so nothing can move
+    # through it. Older servers don't send it: every offer is priced.
+    has_price = o.get("HasPrice", True)
     out = {
         "key": key, "tagItems": tags.get(norm(o.get("Tag")), []) if o.get("Tag") and not o.get("Item") else None,
         "item": o.get("Item"), "itemName": o.get("ItemName"), "tag": o.get("Tag"), "category": o.get("Category"),
-        "price": o["Price"], "limit": o.get("Limit", 0),
+        "price": o["Price"], "hasPrice": has_price, "limit": o.get("Limit", 0),
         "minDurability": o.get("MinDurability"), "minIntegrity": o.get("MinIntegrity"),
     }
     if buying:
         # quantity = what the planner may sell here: the live CanAccept already folds in demand, the owner's money and
-        # free storage. 999 + unlimited mirrors the save-based PoC for offers with no limit at all.
+        # free storage. 999 + noCap mirrors the save-based PoC for offers nothing caps at all (the raw Limit can't tell:
+        # "no limit" is 0 on 0.14.1 and -1 on 0.14.2).
         accept = o.get("CanAccept")
         out.update({
-            "quantity": accept if accept is not None else 999, "unlimited": o.get("Wanted") is None,
+            "quantity": 0 if not has_price else accept if accept is not None else 999,
+            "unlimited": o.get("Wanted") is None, "noCap": has_price and accept is None,
+            "limitMode": o.get("LimitMode", "AvailableQuantity"),
             "wanted": o.get("Wanted"), "canAfford": o.get("CanAfford"), "canStore": o.get("CanStore"), "canAccept": accept,
         })
     else:
-        out.update({"quantity": o["Available"], "unlimited": False})
+        out.update({"quantity": o["Available"] if has_price else 0, "unlimited": False,
+                    "discountTiers": clean_tiers(o.get("DiscountTiers"))})
     return out
 
 
@@ -83,7 +96,9 @@ def main():
             "position": {"x": p["X"], "y": p["Y"], "z": p["Z"]},
             "on": s["On"], "enabled": s["Enabled"], "operating": s["Operating"],
             "currency": s.get("Currency"), "bankAccount": s.get("BankAccount"),
-            "balance": "infinite" if s.get("UnlimitedBalance") else s.get("Balance"),
+            # What buy offers can still pay out: above the owner's MinimumBalance floor (0.14.2; absent = 0).
+            "balance": "infinite" if s.get("UnlimitedBalance") else spendable(s.get("Balance"), s.get("MinimumBalance")),
+            "minimumBalance": s.get("MinimumBalance") or 0,
             "emptySlots": s.get("EmptySlots"),
             "sells": [offer(o, False, f"{s['Id']}/s{n}", tags) for n, o in enumerate(s["Sells"])],
             "buys": [offer(o, True, f"{s['Id']}/b{n}", tags) for n, o in enumerate(s["Buys"])],
