@@ -31,6 +31,12 @@ point it elsewhere with `?server=https://your.server`.
 - **Storage space** at a buyer: the server's dry run of each delivery (per item, also for tag offers like "any Wood"),
   plus the store's free slots shared by everything one run sells there. A store whose storage only takes non-carried
   items gets no logs, whatever its offer says.
+- **Freshness** (food) and wear (tools) are durability. A purchase can hand you any stack the sell offer lets through,
+  so the planner counts on the worst: the stock's lowest freshness (newer RecipeApi), else the sell offer's own minimum
+  (50% by default, but sellers can lower it). Food loses freshness on the road (100% per shelf life, about 1% an hour
+  for most food). A deal is dropped when that is below the buyer's minimum; the card shows freshness on food lines.
+- **Map**: the world wraps around, so the map is drawn tiled: pan past an edge and the other side follows; legs crossing
+  the edge are one line. Faint dashed lines mark the seams.
 - **Shared demand**: a buy offer wants its limit minus the shop's stock of every item it takes, whichever offer they
   were sold to, so Fiddleheads sold to a Fiddleheads offer also fill an "any Greens" offer. Sales at earlier stops
   count against every offer that takes their items. Within a stop the card lists tag offers first and says when the

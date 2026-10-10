@@ -218,7 +218,7 @@ async function load() {
       getJSON(API + "/vehicles").catch(() => ({ Vehicles: null })), // older RecipeApi without /vehicles
     ]);
     ITEMS = {};
-    for (const i of items.Items) ITEMS[i.Item] = { weightKg: i.Weight / 1000, stackSize: i.MaxStackSize, carried: i.Carried, name: i.Name, tags: i.Tags };
+    for (const i of items.Items) ITEMS[i.Item] = { weightKg: i.Weight / 1000, stackSize: i.MaxStackSize, carried: i.Carried, name: i.Name, tags: i.Tags, shelfLife: i.ShelfLife ?? null };
     // Tag -> items. Exact from /items Tags; older servers: /tags (display names), matched loosely.
     const tagIndex = {};
     if (items.Items.length && items.Items[0].Tags) {
@@ -243,12 +243,14 @@ async function load() {
       balance: s.UnlimitedBalance ? "infinite" : s.Balance == null ? s.Balance : Math.max(0, s.Balance - (s.MinimumBalance || 0)),
       minBalance: s.MinimumBalance || 0,
       sells: s.Sells.map((o, n) => ({ key: `${s.Id}/s${n}`, item: o.Item, tag: o.Tag, price: o.Price, limit: o.Limit, hasPrice: o.HasPrice !== false,
-        quantity: o.HasPrice === false ? 0 : o.Available, tiers: o.DiscountTiers || [] })),
+        quantity: o.HasPrice === false ? 0 : o.Available, tiers: o.DiscountTiers || [],
+        minDur: o.MinDurability ?? -1, maxDur: o.MaxDurability ?? -1, stockDur: o.Durability || null })),
       buys: s.Buys.map((o, n) => ({
         key: `${s.Id}/b${n}`, item: o.Item, tag: o.Tag, price: o.Price, limit: o.Limit, hasPrice: o.HasPrice !== false, limitMode: o.LimitMode || null,
         tagItems: o.Item ? null : (tagIndex[norm(o.Tag)] || []),
         quantity: o.HasPrice === false ? 0 : o.CanAccept ?? 999, noCap: o.HasPrice !== false && o.CanAccept == null,
         unlimited: o.Wanted == null, wanted: o.Wanted, canAfford: o.CanAfford, canStore: o.CanStore, canStoreItems: o.CanStoreItems || null,
+        minDur: o.MinDurability ?? -1, maxDur: o.MaxDurability ?? -1,
       })),
     }));
     BYID = Object.fromEntries(SHOPS.map(s => [s.id, s]));
@@ -404,6 +406,21 @@ const discountFor = (so, q) => so.price > 0 ? Math.max(0, ...(so.tiers || []).fi
 const lineCost = (so, q) => q * so.price * (1 - discountFor(so, q) / 100);
 const bestPrice = so => so.price > 0 ? so.price * (1 - Math.max(0, ...(so.tiers || []).map(t => t.DiscountPercent)) / 100) : so.price;
 
+// Freshness (food) and wear (tools) are durability. A purchase can hand you any stack the sell offer lets through, so count on
+// the worst: the stock's lowest durability when the server reports it (newer RecipeApi), otherwise the sell offer's own
+// minimum (50% by default for food; a seller may lower it). Food keeps spoiling on the road, 100% per shelf life. The buyer
+// refuses anything under its offer's minimum, or over its maximum.
+const isFood = name => !!itemInfo(name).shelfLife || (itemInfo(name).tags || []).includes("Food");   // shelf life: newer RecipeApi
+function worstFresh(so, name, minutes) {
+  if (so.stockDur) { const shelf = itemInfo(name).shelfLife; return so.stockDur.Min - (shelf ? 100 * minutes * 60 / shelf : 0); }
+  return so.minDur >= 0 ? so.minDur : null;   // only the offer's bound: stock is usually fresher, so no spoilage on top
+}
+function freshnessOk(so, bo, name, minutes) {
+  if (bo.minDur > 0) { const w = worstFresh(so, name, minutes); if (w != null && Math.round(w) < bo.minDur) return false; }
+  if (bo.maxDur >= 0 && so.stockDur && Math.round(so.stockDur.Max) > bo.maxDur) return false;
+  return true;
+}
+
 function buildMarket() {
   const open = SHOPS.filter(s => s.on && s.enabled && s.currency && s.currency === S.currency);
   const byId = Object.fromEntries(open.map(s => [s.id, s]));
@@ -417,7 +434,7 @@ function buildMarket() {
       if (bo.quantity <= 0) continue;
       for (const name of bo.item ? [bo.item] : (bo.tagItems || [])) {   // a tag offer takes any item in its tag, sharing one limit
         const so = sells[X.id][name];
-        if (!so || !fits(name)) continue;
+        if (!so || !fits(name) || !freshnessOk(so, bo, name, 0)) continue;
         // unit ranks the candidate: the margin at the list price, or at the best discount for a deal that only pays with one
         // (each lot is then priced by its real quantity and dropped if that doesn't reach the tier).
         const unit = bo.price * (1 + S.bonus) - so.price, best = bo.price * (1 + S.bonus) - bestPrice(so);
@@ -506,8 +523,10 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash, stopTo) {
   const stored = { ...(st.stored?.[Y]) };                  // what's in the buyer's storage from this plan, this leg included
   const sales = [...(st.sales?.[Y] || [])];               // the run's sales to this shop so far, this leg included
   let usedSlots = 0, usedW = 0, cost = 0, revenue = 0;
+  const tripMinutes = legMinutes(X, Y);
   for (const { name, so, bo, unit } of cands) {
     const it = itemInfo(name);
+    if (!freshnessOk(so, bo, name, tripMinutes)) continue;   // spoils below what the buyer takes on the way
     const avail = so.quantity - (st.sold[X + "|" + name] || 0) - (used[name] || 0);
     const want = demandRoom(Y, bo, name, stopTo, sales);
     let q = Math.min(avail, want);
@@ -618,6 +637,7 @@ function packRun(run) {
   const sales = {}, salesAt = Y => sales[Y] ||= [...(DONE.sales?.[Y] || [])];
   for (const { i, j, name, so, bo } of lots) {
     const X = path[i], Y = path[j], it = itemInfo(name), stack = stackOf(name), Ys = BYID[Y];
+    if (!freshnessOk(so, bo, name, run.legs.slice(i, j).reduce((n, l) => n + l.minutes, 0))) continue;
     let q = so.quantity - (DONE.sold[X + "|" + name] || 0) - (sold[X + "|" + name] || 0);
     q = Math.min(q, demandRoom(Y, bo, name, j, salesAt(Y)));
     if (Ys.balance !== "infinite" && bo.price > 0) q = Math.min(q, Math.floor(((Ys.balance || 0) - (DONE.money[Y] || 0) - (paid[Y] || 0)) / bo.price));
@@ -766,7 +786,8 @@ let TRACK = store.get("track", null), trackTimer = null;
 function startTracking(r) {
   const stops = runStops(r).map((s, k) => ({
     sell: s.sell.map(l => { const o = BYID[r.path[k]].buys.find(b => b.key === l.offer) || {}; return { item: l.item, qty: l.qty, price: l.sell, tag: o.tag ?? null, offerItem: o.item ?? null }; }),
-    buy: s.buy.map(b => ({ item: b.item, qty: b.qty, price: b.list ?? b.buy })),   // the list price: what the shop shows and may change
+    buy: s.buy.map(b => ({ item: b.item, qty: b.qty, price: b.list ?? b.buy,   // the list price: what the shop shows and may change
+      needFresh: Math.max(-1, ...b.parts.map(p => offerOf(r.path[p.to], p.offer)?.minDur ?? -1)) })),   // the strictest buyer's minimum
   }));
   TRACK = { path: r.path, names: r.path.map(id => BYID[id].name), pos: r.path.map(id => BYID[id].position), stops,
     profit: r.profit, currency: S.currency, player: start?.kind === "player" ? start.name : null, at: -1,
@@ -804,6 +825,12 @@ async function checkTrack() {
       if (o && o.HasPrice === false) { say(k, "bad", `${name} has taken the price off ${pretty(b.item)}: it can't be bought`); continue; }
       if (!o || o.Available <= 0) say(k, "bad", `${name} has no ${pretty(b.item)} left (you need ${fmt(b.qty, 0)})`);
       else if (o.Available < b.qty) say(k, "warn", `${name} has only ${fmt(o.Available, 0)} of the ${fmt(b.qty, 0)} ${pretty(b.item)}`);
+      if (o && b.needFresh > 0) {
+        const worst = o.Durability ? o.Durability.Min : o.MinDurability;
+        if (worst != null && worst >= 0 && Math.round(worst) < b.needFresh)
+          say(k, "bad", o.Durability ? `${name}'s ${pretty(b.item)} is only ${fmt(worst, 0)}% fresh at worst; your buyer wants ≥${fmt(b.needFresh, 0)}%`
+            : `${name} now sells ${pretty(b.item)} down to ${fmt(worst, 0)}% fresh; your buyer wants ≥${fmt(b.needFresh, 0)}%`);
+      }
       if (o && o.Price > b.price + 1e-9) say(k, "warn", `${name} now sells ${pretty(b.item)} at ${fmt(o.Price, 2)} (was ${fmt(b.price, 2)})`);
     }
     const offers = new Map();   // our sales per buy offer: an offer's demand is shared by all items it takes
@@ -1122,6 +1149,9 @@ function resize() {
   if (!view.s && r.width && r.height) return fit();
   draw();
 }
+// Zooming out stops where one copy of the world still covers most of the map area: the tiles show the wrap at the
+// edges, not the world many times over.
+const minScale = () => { const r = cv.getBoundingClientRect(); return Math.min(Math.min(r.width, r.height), Math.max(r.width, r.height) * 0.7) / 1000; };   // never below "Reset view"
 function fit() { const r = cv.getBoundingClientRect(), s = Math.min(r.width, r.height) / 1000; if (!s) return; view = { s, ox: (r.width - 1000 * s) / 2, oy: (r.height - 1000 * s) / 2 }; draw(); }
 const toScreen = (x, z) => [x / W * 1000 * view.s + view.ox, (W - z) / W * 1000 * view.s + view.oy];   //north up
 const toWorld = (sx, sy) => [((sx - view.ox) / view.s) / 1000 * W, W - ((sy - view.oy) / view.s) / 1000 * W];
@@ -1129,7 +1159,7 @@ const wrapDelta = d => !S.wrap ? d : d > W / 2 ? d - W : d < -W / 2 ? d + W : d;
 
 function arrow(a, b, color, width, label, dashed) {
   const dx = wrapDelta(b.x - a.x), dz = wrapDelta(b.z - a.z);
-  const copies = S.wrap ? [[a.x, a.z], [b.x - dx, b.z - dz]] : [[a.x, a.z]];
+  const copies = [[a.x, a.z]];   // across the world's edge the line just carries on: the map is drawn tiled
   for (const [sx, sz] of copies) {
     const [x1, y1] = toScreen(sx, sz), [x2, y2] = toScreen(sx + dx, sz + dz);
     ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width; ctx.lineCap = "round";
@@ -1180,15 +1210,21 @@ const drawLeg = (a, b, color, width, text, dashed) => S.routing === "terrain" ? 
 // A routed path in world coordinates, cut where it crosses the world's edge (it wraps: a boat sailing off the west side
 // comes back on the east), so it isn't drawn as a line across the whole map.
 // Also cut where a land vehicle + boat route switches vehicle; each piece says whether it's by boat (seg.boat).
+// The map is drawn tiled, so a path crossing the world's edge is unwrapped: it carries on past the edge into the
+// neighbouring copy instead of jumping back across the map.
 function worldSegments(points, boat) {
   const start = (i, from) => { const s = from ? [from] : []; s.boat = !!(boat && boat[i]); return s; };
   const segs = [start(0)];
-  segs[0].push(points[0]);
+  let ox = 0, oz = 0, prev = points[0];
+  segs[0].push(prev);
   for (let i = 1; i < points.length; i++) {
-    const p = points[i], q = points[i - 1];
-    if (Math.abs(p.x - q.x) > W / 2 || Math.abs(p.z - q.z) > W / 2) segs.push(start(i));
-    else if (boat && boat[i] !== boat[i - 1]) segs.push(start(i, q));   // switch: the new piece starts where the old one ended
+    const raw = points[i], last = points[i - 1];
+    if (raw.x - last.x > W / 2) ox -= W; else if (last.x - raw.x > W / 2) ox += W;
+    if (raw.z - last.z > W / 2) oz -= W; else if (last.z - raw.z > W / 2) oz += W;
+    const p = { x: raw.x + ox, z: raw.z + oz };
+    if (boat && boat[i] !== boat[i - 1]) segs.push(start(i, prev));   // switch: the new piece starts where the old one ended
     segs[segs.length - 1].push(p);
+    prev = p;
   }
   return segs.filter(s => s.length >= 2);
 }
@@ -1281,12 +1317,30 @@ function label(text, x, y, bold) {
   ctx.font = `${bold ? "600 " : ""}12px system-ui`; ctx.textBaseline = "middle"; ctx.textAlign = "left"; ctx.lineWidth = 3;
   ctx.strokeStyle = "rgba(0,0,0,.6)"; ctx.strokeText(text, x, y); ctx.fillStyle = "#fff"; ctx.fillText(text, x, y);
 }
+// The world wraps around (leave it on one side, come back on the other), so the map is drawn as tiles: every copy that
+// shows on screen gets the map and everything on it, and you can pan on forever. Faint dashed lines mark the seams.
+function tileRange(o, size) {
+  const T = 1000 * view.s;
+  return { from: Math.floor(-o / T), to: Math.floor((size - o) / T) };
+}
 function draw() {
   if (!view.s) return;
-  const r = cv.getBoundingClientRect();
+  const r = cv.getBoundingClientRect(), T = 1000 * view.s;
   ctx.clearRect(0, 0, r.width, r.height);
-  ctx.imageSmoothingEnabled = (IMG.naturalWidth || 0) > 1000 * view.s;
-  if (IMG.complete && IMG.naturalWidth) ctx.drawImage(IMG, view.ox, view.oy, 1000 * view.s, 1000 * view.s);
+  ctx.imageSmoothingEnabled = (IMG.naturalWidth || 0) > T;
+  const tx = tileRange(view.ox, r.width), ty = tileRange(view.oy, r.height);
+  if (IMG.complete && IMG.naturalWidth)
+    for (let kx = tx.from; kx <= tx.to; kx++) for (let ky = ty.from; ky <= ty.to; ky++) ctx.drawImage(IMG, view.ox + kx * T, view.oy + ky * T, T, T);
+  ctx.save(); ctx.setLineDash([5, 7]); ctx.lineWidth = 1; ctx.strokeStyle = "rgba(255,255,255,.28)";
+  for (let kx = tx.from + 1; kx <= tx.to; kx++) { const x = Math.round(view.ox + kx * T) + 0.5; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, r.height); ctx.stroke(); }
+  for (let ky = ty.from + 1; ky <= ty.to; ky++) { const y = Math.round(view.oy + ky * T) + 0.5; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(r.width, y); ctx.stroke(); }
+  ctx.restore();
+  // Things on the map, in every copy (one extra each way so lines leaving a copy are drawn where they arrive).
+  for (let kx = tx.from - 1; kx <= tx.to + 1; kx++) for (let ky = ty.from - 1; ky <= ty.to + 1; ky++) {
+    ctx.save(); ctx.translate(kx * T, ky * T); drawOverlay(); ctx.restore();
+  }
+}
+function drawOverlay() {
   const hi = new Set(), sideStops = new Set(), sp = startPosition();
   let stopPath = null;
   if (selected?.kind === "run" && RUNS[selected.i]) {
@@ -1339,7 +1393,8 @@ cv.addEventListener("pointermove", e => {
   const [wx, wz] = toWorld(mx, my);
   $("coords").textContent = `x ${Math.round(mod(wx, W))}, z ${Math.round(mod(wz, W))}`;
   let best = null, bd = 12;
-  for (const s of SHOPS) { const [x, y] = toScreen(s.x, s.z), d = Math.hypot(x - mx, y - my); if (d < bd) { bd = d; best = s; } }
+  const wd = d => d - W * Math.round(d / W), px = 1000 * view.s / W;   // world distance across the wrap, in screen pixels
+  for (const s of SHOPS) { const d = Math.hypot(wd(s.x - wx), wd(s.z - wz)) * px; if (d < bd) { bd = d; best = s; } }
   if (best !== hoverShop) { hoverShop = best; draw(); }
   const tip = $("tip");
   if (best && !picking) {
@@ -1365,7 +1420,7 @@ cv.addEventListener("pointerleave", () => { $("tip").style.display = "none"; hov
 cv.addEventListener("wheel", e => {
   e.preventDefault();
   const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
-  const ns = Math.min(Math.max(view.s * Math.exp(-e.deltaY * 0.0015), 0.3), 16);
+  const ns = Math.min(Math.max(view.s * Math.exp(-e.deltaY * 0.0015), minScale()), 16);
   view.ox = mx - (mx - view.ox) * ns / view.s; view.oy = my - (my - view.oy) * ns / view.s; view.s = ns; draw();
 }, { passive: false });
 $("fit").onclick = fit;
@@ -1457,8 +1512,8 @@ function runStops(r) {
   const stops = r.path.map(() => ({ sell: [], buy: [] }));
   const buy = (k, l, to) => {
     let m = stops[k].buy.find(b => b.item === l.item);
-    if (!m) stops[k].buy.push(m = { item: l.item, buy: l.buy, list: l.list ?? l.buy, unknown: l.unknown, qty: 0, parts: [] });
-    m.qty += l.qty; m.parts.push({ qty: l.qty, to, viaTag: l.viaTag });
+    if (!m) stops[k].buy.push(m = { item: l.item, buy: l.buy, list: l.list ?? l.buy, unknown: l.unknown, sellKey: l.sellKey, qty: 0, parts: [] });
+    m.qty += l.qty; m.parts.push({ qty: l.qty, to, viaTag: l.viaTag, offer: l.offer });
   };
   r.legs.forEach((leg, k) => leg.load.forEach(l => { buy(k, l, k + 1); stops[k + 1].sell.push(l); }));
   r.side.forEach(sd => sd.load.forEach(l => { buy(sd.fromStop, l, sd.toStop); stops[sd.toStop].sell.push(l); }));
@@ -1492,6 +1547,14 @@ function runCard(r) {
       else if (l.parts[0].to > k + 1 || l.parts[0].viaTag) notes.push(part(l.parts[0]).replace("for the next stop as", "as"));
     }
     if (verb === "buy" && l.list > l.buy + 1e-9) notes.push(`−${fmt(100 * (1 - l.buy / l.list), 0)}% for ${fmt(l.qty, 0)} (list ${fmt(l.list, 2)})`);
+    if (verb === "buy") {   // how fresh (or worn) what you get is
+      const so = (BYID[r.path[k]]?.sells || []).find(o => o.key === l.sellKey);
+      if (so?.stockDur) notes.push(so.stockDur.Min === so.stockDur.Max ? `${fmt(so.stockDur.Min, 0)}% fresh` : `${fmt(so.stockDur.Min, 0)}–${fmt(so.stockDur.Max, 0)}% fresh`);
+      else if (so && so.minDur > 0 && isFood(l.item)) notes.push(`≥${fmt(so.minDur, 0)}% fresh`);
+    } else {
+      const bo = offerOf(r.path[k], l.offer);
+      if (bo && bo.minDur > 0 && isFood(l.item)) notes.push(`needs ≥${fmt(bo.minDur, 0)}% fresh`);
+    }
     if (l.unknown) notes.push("⚠ no item data");
     return `<div class="act ${verb}"><span class="verb">${verb}</span><span class="qty">${fmt(l.qty, 0)}</span>` +
       `<span class="what">${esc(pretty(l.item))}${notes.map(n => `<span class="note">${n}</span>`).join("")}${split}</span>` +
