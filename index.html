@@ -70,10 +70,13 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .act .what { min-width: 0; }
 .act .note { color: var(--side); font-size: 11px; margin-left: 4px; white-space: nowrap; }
 .act .split { display: block; color: var(--side); font-size: 11px; }
-.track { border-bottom: 1px solid var(--line); padding: 10px 14px; background: var(--accent-soft); display: none; }
+.track { border-bottom: 1px solid var(--line); padding: 8px 14px; background: var(--accent-soft); display: none; max-height: 34vh; overflow-y: auto; flex: none; }
 .track.on { display: block; }
-.track .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; font-weight: 600; }
-.track .tstop { display: grid; grid-template-columns: 20px 1fr auto; gap: 6px; align-items: start; padding: 3px 0; font-size: 12.5px; }
+.track .head { display: flex; justify-content: space-between; gap: 8px; align-items: center; font-weight: 600; }
+.track .head .fold { cursor: pointer; user-select: none; }
+.track .tstop .name { cursor: pointer; }
+.track .tstop .count { color: var(--muted); font-size: 11.5px; margin-left: 4px; }
+.track .tstop { display: grid; grid-template-columns: 18px 1fr auto; gap: 6px; align-items: start; padding: 2px 0; font-size: 12.5px; }
 .track .tstop .mark { text-align: center; }
 .track .tstop.done { color: var(--muted); }
 .track .tstop .what { color: var(--muted); font-size: 11.5px; }
@@ -733,6 +736,7 @@ function startTracking(r) {
     profit: r.profit, currency: S.currency, player: start?.kind === "player" ? start.name : null, at: -1,
     started: Date.now(), checked: null, dataAt: null, problems: [], told: [] };
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
+  trackOpen.clear();
   saveTrack(); trackProgress(); checkTrack(); scheduleTrack();
 }
 function stopTracking() { TRACK = null; saveTrack(); clearInterval(trackTimer); trackTimer = null; document.title = "Trade Route Planner"; renderTrack(); }
@@ -806,22 +810,36 @@ function renderTrack() {
   const t = TRACK, bad = t.problems.some(p => p.level === "bad");
   document.title = (t.problems.length ? (bad ? "⛔ " : "⚠ ") : "") + "Trade Route Planner";
   const time = ms => new Date(ms).toLocaleTimeString();
-  let html = `<div class="head"><span>Tracking: +${fmt(t.profit)} ${esc(t.currency)}</span><button class="tiny" data-untrack>Stop tracking</button></div>`;
+  // Compact: one line per stop; the items only for the next stop, stops with a problem, and stops you click open (the
+  // run card below has the full list). The ▾ folds the panel to its summary.
+  const folded = store.get("trackFolded", false), status = t.problems.length ? `${t.problems.length} problem${t.problems.length > 1 ? "s" : ""} ahead`
+    : t.at >= t.path.length - 1 ? "run done" : t.checked ? "all trades ahead still available" : "checking…";
+  let html = `<div class="head"><span class="fold" data-fold title="${folded ? "Show the stops" : "Fold"}">${folded ? "▸" : "▾"} Tracking +${fmt(t.profit)} ${esc(t.currency)}` +
+    ` <span class="${bad ? "bad" : t.problems.length ? "warn" : "okline"}" style="font-weight:600">· ${status}</span></span><button class="tiny" data-untrack>Stop tracking</button></div>`;
+  if (folded) { el.innerHTML = html; bindTrack(el); return; }
   html += `<div class="sub">${t.checked ? `Checked ${time(t.checked)}` : "Checking…"} · every minute${t.player ? ` · following ${esc(t.player)}` : " · tick stops off as you go"}</div>`;
   if (t.error) html += `<div class="warn">Couldn't check: ${esc(t.error)}</div>`;
   t.path.forEach((id, k) => {
-    const st = t.stops[k], done = k <= t.at, probs = t.problems.filter(p => p.stop === k);
-    const mark = done ? "✓" : probs.some(p => p.level === "bad") ? "⛔" : probs.length ? "⚠" : k === t.at + 1 ? "▶" : "○";
+    const st = t.stops[k], done = k <= t.at, probs = t.problems.filter(p => p.stop === k), next = k === t.at + 1;
+    const mark = done ? "✓" : probs.some(p => p.level === "bad") ? "⛔" : probs.length ? "⚠" : next ? "▶" : "○";
+    const open = trackOpen.get(k) ?? (!done && (next || probs.length > 0));
+    const count = [st.sell.length && `sell ${st.sell.length}`, st.buy.length && `buy ${st.buy.length}`].filter(Boolean).join(" · ") + " items";
     const what = [...st.sell.map(l => `sell ${fmt(l.qty, 0)} ${pretty(l.item)}`), ...st.buy.map(b => `buy ${fmt(b.qty, 0)} ${pretty(b.item)}`)].join(", ");
-    html += `<div class="tstop${done ? " done" : ""}"><span class="mark">${mark}</span><span>${k + 1}. ${esc(t.names[k])}<br><span class="what">${esc(what)}</span>` +
+    html += `<div class="tstop${done ? " done" : ""}"><span class="mark">${mark}</span><span><span class="name" data-track-open="${k}" title="${open ? "Hide" : "Show"} the items">${k + 1}. ${esc(t.names[k])}</span>` +
+      (open ? `<br><span class="what">${esc(what)}</span>` : `<span class="count">${count}</span>`) +
       probs.map(p => `<br><span class="${p.level}">${esc(p.text)}</span>`).join("") + `</span>` +
       (done ? `<button class="tiny" data-track-at="${k - 1}" title="Not done yet">undo</button>` : `<button class="tiny" data-track-at="${k}" title="I'm done at this stop">✓</button>`) + `</div>`;
   });
-  if (t.checked && !t.problems.length && t.at < t.path.length - 1) html += `<div class="okline">All trades ahead are still available.</div>`;
   if (t.at >= t.path.length - 1) html += `<div class="okline">Run done. Use “Continue from ${esc(t.names[t.names.length - 1])}” to plan the next one.</div>`;
   el.innerHTML = html;
+  bindTrack(el);
+}
+const trackOpen = new Map();   // stops opened or closed by hand in the tracking panel: k -> open
+function bindTrack(el) {
   el.querySelector("[data-untrack]").onclick = stopTracking;
+  el.querySelector("[data-fold]").onclick = () => { store.set("trackFolded", !store.get("trackFolded", false)); renderTrack(); };
   el.querySelectorAll("[data-track-at]").forEach(b => b.onclick = () => setTrackAt(+b.dataset.trackAt));
+  el.querySelectorAll("[data-track-open]").forEach(n => n.onclick = () => { const k = +n.dataset.trackOpen; trackOpen.set(k, !n.parentElement.querySelector(".what")); renderTrack(); });
 }
 
 let replanTimer = null;
