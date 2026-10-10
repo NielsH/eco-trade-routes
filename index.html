@@ -70,6 +70,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .act .what { min-width: 0; }
 .act .note { color: var(--side); font-size: 11px; margin-left: 4px; white-space: nowrap; }
 .act .split { display: block; color: var(--side); font-size: 11px; }
+.stop .order { color: #d9822b; font-size: 11.5px; padding: 0 0 3px; }
 .track { border-bottom: 1px solid var(--line); padding: 8px 14px; background: var(--accent-soft); display: none; max-height: 34vh; overflow-y: auto; flex: none; }
 .track.on { display: block; }
 .track .head { display: flex; justify-content: space-between; gap: 8px; align-items: center; font-weight: 600; }
@@ -196,7 +197,7 @@ let start = store.get("start", null);   // null | {kind:"pos", x, z, label} | {k
 let tab = "runs", selected = null, hoverShop = null, hoverLeg = null, picking = false, loadedAt = null;
 // Trades of runs you finished ("Continue from"), kept until fresh data shows them: the server caches /shops for up to
 // 60 s, so a sale from seconds ago can still be missing. DONE is the part not visible yet, subtracted while planning.
-let TRADES = { sells: {}, buys: {}, money: {}, stored: {} }, DONE = { sold: {}, bought: {}, money: {}, stored: {} }, tradeCheck = null;
+let TRADES = { sells: {}, buys: {}, money: {}, stored: {} }, DONE = { sold: {}, bought: {}, money: {}, stored: {}, sales: {} }, tradeCheck = null;
 const TRADE_TTL_MS = 3 * 60 * 1000;   // well past the server's 60 s cache: by then fresh data must include the trade
 const S = {};                            // settings, read from the form
 
@@ -276,8 +277,9 @@ function recordTrades(r) {
     TRADES.sells[sk].qty += l.qty;
     const bo = BYID[leg.to].buys.find(o => o.key === l.offer);
     if (bo && !bo.noCap) {   // an offer without a limit has no demand to use up
-      TRADES.buys[l.offer] ||= { shop: leg.to, key: l.offer, item: bo.item, tag: bo.tag, qty: 0, before: bo.quantity, at: now };
+      TRADES.buys[l.offer] ||= { shop: leg.to, key: l.offer, item: bo.item, tag: bo.tag, qty: 0, items: {}, before: bo.quantity, at: now };
       TRADES.buys[l.offer].qty += l.qty;
+      TRADES.buys[l.offer].items[l.item] = (TRADES.buys[l.offer].items[l.item] || 0) + l.qty;
     }
   }
   for (const leg of legs) {
@@ -293,7 +295,7 @@ function recordTrades(r) {
 // After a reload: whatever the server already shows is taken as-is; only the rest stays in DONE. Trades fully visible, or
 // older than TRADE_TTL_MS, are forgotten. Approximate when other players trade at the same shops in between.
 function reconcile(sameData) {
-  const done = { sold: {}, bought: {}, money: {}, stored: {} }, now = Date.now();
+  const done = { sold: {}, bought: {}, money: {}, stored: {}, sales: {} }, now = Date.now();
   let seen = 0, total = 0;
   const unseen = (qty, before, after) => qty - Math.max(0, Math.min(qty, before - after));
   for (const [k, x] of Object.entries(TRADES.sells)) {
@@ -306,7 +308,11 @@ function reconcile(sameData) {
     const offers = BYID[x.shop]?.buys || [], bo = offers.find(o => o.key === k && o.item === x.item && o.tag === x.tag) || offers.find(o => o.item === x.item && o.tag === x.tag);
     const left = bo ? unseen(x.qty, x.before, bo.quantity) : 0;   // offer gone: nothing left to subtract
     total++; if (left <= 0) seen++;
-    if (left > 0 && now - x.at < TRADE_TTL_MS) done.bought[bo.key] = left; else delete TRADES.buys[k];
+    if (left > 0 && now - x.at < TRADE_TTL_MS) {
+      done.bought[bo.key] = left;
+      for (const [item, q] of Object.entries(x.items || {}))   // still unseen, per item: it counts against every offer taking it
+        (done.sales[x.shop] ||= []).push({ stop: -1, key: bo.key, item, qty: Math.ceil(q * left / x.qty) });
+    } else delete TRADES.buys[k];
   }
   for (const [k, x] of Object.entries(TRADES.money)) {
     const bal = BYID[x.shop]?.balance;
@@ -464,7 +470,33 @@ function storeRoom(Y, name, stored, bo) {
 }
 const moneyOf = (Y, used) => { const b = BYID[Y].balance; return b === "infinite" ? Infinity : (b || 0) - (DONE.money[Y] || 0) - (used || 0); };
 
-function fill(X, Y, st, slotsLeft, weightLeft, cash) {
+// Shared demand at a shop. A buy offer's demand is its limit minus the shop's stock of every item it takes, whichever
+// offer they were sold to: Fiddleheads sold to a Fiddleheads offer also fill an "any Greens" offer. Within one stop the
+// sales are one trade (the store checks each offer before anything moves), so against an offer count its own sales at
+// that stop plus every sale of an item it takes at earlier stops. sales: [{stop, key, item, qty}]; stop -1 = earlier
+// runs not yet visible on the server.
+const takesItem = (bo, item) => bo.item ? bo.item === item : (bo.tagItems || []).includes(item);
+const offerOf = (Y, key) => (BYID[Y]?.buys || []).find(o => o.key === key);
+function offerLoad(bo, j, sales) {
+  let n = 0;
+  for (const s of sales) if (s.key === bo.key ? s.stop <= j : s.stop < j && takesItem(bo, s.item)) n += s.qty;
+  return n;
+}
+// How many more of `item` a shop takes through offer bo at stop j: its own demand, and that of the offers the run sells
+// to there at later stops which take the same item (selling now fills them too).
+function demandRoom(Y, bo, item, j, sales) {
+  let room = bo.noCap ? Infinity : bo.quantity - offerLoad(bo, j, sales);
+  const seen = new Set();
+  for (const s of sales) {
+    if (s.stop <= j || seen.has(s.key + "@" + s.stop)) continue;
+    seen.add(s.key + "@" + s.stop);
+    const o = offerOf(Y, s.key);
+    if (o && !o.noCap && takesItem(o, item)) room = Math.min(room, o.quantity - offerLoad(o, s.stop, sales));
+  }
+  return room;
+}
+
+function fill(X, Y, st, slotsLeft, weightLeft, cash, stopTo) {
   const cands = [...(M.pairs.get(X + "|" + Y) || [])];
   const ym = moneyOf(Y, (st.money[Y] || 0) - (DONE.money[Y] || 0)), dens = c => density(c, 1, ym);
   cands.sort((a, b) => dens(b) - dens(a));
@@ -472,12 +504,12 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
   const yMoney = Ys.balance === "infinite" ? Infinity : (Ys.balance || 0) - (st.money[Y] || 0);
   const load = [], partial = {}, taken = {}, used = {};   // taken: per buy offer; used: per item of the seller's stock (two offers can want one item)
   const stored = { ...(st.stored?.[Y]) };                  // what's in the buyer's storage from this plan, this leg included
+  const sales = [...(st.sales?.[Y] || [])];               // the run's sales to this shop so far, this leg included
   let usedSlots = 0, usedW = 0, cost = 0, revenue = 0;
   for (const { name, so, bo, unit } of cands) {
     const it = itemInfo(name);
     const avail = so.quantity - (st.sold[X + "|" + name] || 0) - (used[name] || 0);
-    let want = bo.quantity - (st.bought[bo.key] || 0) - (taken[bo.key] || 0);
-    if (bo.noCap) want = Infinity;
+    const want = demandRoom(Y, bo, name, stopTo, sales);
     let q = Math.min(avail, want);
     if (q <= 0) continue;
     const stack = stackOf(name);
@@ -490,6 +522,7 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
     const lotCost = lineCost(so, q), lotRevenue = q * bo.price * (1 + S.bonus);
     if (lotRevenue - lotCost <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
     stored[name] = (stored[name] || 0) + q;
+    sales.push({ stop: stopTo, key: bo.key, item: name, qty: q });
     const newTotal = q - (partial[name] || 0);
     usedSlots += Math.max(0, Math.ceil(newTotal / stack));
     partial[name] = mod(-newTotal, stack);
@@ -500,8 +533,9 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash) {
   return { load, slots: usedSlots, w: usedW, cost, revenue };
 }
 
-function apply(st, X, Y, load, revenue) {
-  const n = { sold: { ...st.sold }, bought: { ...st.bought }, money: { ...st.money }, stored: { ...st.stored, [Y]: { ...st.stored?.[Y] } } };
+function apply(st, X, Y, load, revenue, stopTo) {
+  const n = { sold: { ...st.sold }, bought: { ...st.bought }, money: { ...st.money }, stored: { ...st.stored, [Y]: { ...st.stored?.[Y] } },
+    sales: { ...st.sales, [Y]: [...(st.sales?.[Y] || []), ...load.map(l => ({ stop: stopTo, key: l.offer, item: l.item, qty: l.qty }))] } };
   for (const l of load) {
     n.sold[X + "|" + l.item] = (n.sold[X + "|" + l.item] || 0) + l.qty; n.bought[l.offer] = (n.bought[l.offer] || 0) + l.qty;
     n.stored[Y][l.item] = (n.stored[Y][l.item] || 0) + l.qty;
@@ -522,13 +556,13 @@ function plan(startPos) {
     for (const b of beam) {
       const X = b.path[b.path.length - 1];
       for (const Y of M.out[X] || []) {
-        const f = fill(X, Y, b.st, S.slots, S.maxWeightKg, b.cash);
+        const f = fill(X, Y, b.st, S.slots, S.maxWeightKg, b.cash, b.path.length);
         if (!f.load.length) continue;
         const mins = legMinutes(X, Y) + S.stopMinutes;
         if (!isFinite(mins)) continue;   // unreachable without crossing water
         next.push({ path: [...b.path, Y], lead: b.lead,
           legs: [...b.legs, { from: X, to: Y, load: f.load, slots: f.slots, w: f.w, cost: f.cost, revenue: f.revenue, minutes: mins }],
-          profit: b.profit + f.revenue - f.cost, minutes: b.minutes + mins, cash: b.cash - f.cost + f.revenue, st: apply(b.st, X, Y, f.load, f.revenue) });
+          profit: b.profit + f.revenue - f.cost, minutes: b.minutes + mins, cash: b.cash - f.cost + f.revenue, st: apply(b.st, X, Y, f.load, f.revenue, b.path.length) });
       }
     }
     next.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
@@ -555,10 +589,10 @@ function sideDeals(run) {
     let freeSlots = Infinity, freeW = Infinity, cash = Infinity;
     for (let k = i; k < j; k++) { freeSlots = Math.min(freeSlots, S.slots - legs[k].slots); freeW = Math.min(freeW, S.maxWeightKg - legs[k].w); cash = Math.min(cash, cashAt[k]); }
     if (freeSlots <= 0 || freeW <= 0) continue;
-    const f = fill(path[i], path[j], st, freeSlots, freeW, cash);
+    const f = fill(path[i], path[j], st, freeSlots, freeW, cash, j);
     if (!f.load.length) continue;
     for (let k = i; k < j; k++) { legs[k].slots += f.slots; legs[k].w += f.w; cashAt[k] -= f.cost; }
-    st = apply(st, path[i], path[j], f.load, f.revenue);
+    st = apply(st, path[i], path[j], f.load, f.revenue, j);
     side.push({ from: path[i], to: path[j], fromStop: i, toStop: j, load: f.load, cost: f.cost, revenue: f.revenue });
     extra += f.revenue - f.cost;
   }
@@ -581,10 +615,11 @@ function packRun(run) {
   const cash = new Array(L).fill(S.cash);   // cash in hand when leaving stop k, after its buys
   const sold = {}, bought = {}, paid = {}, picks = [], stored = {};
   const storedAt = Y => stored[Y] ||= { ...DONE.stored[Y] };
+  const sales = {}, salesAt = Y => sales[Y] ||= [...(DONE.sales?.[Y] || [])];
   for (const { i, j, name, so, bo } of lots) {
     const X = path[i], Y = path[j], it = itemInfo(name), stack = stackOf(name), Ys = BYID[Y];
     let q = so.quantity - (DONE.sold[X + "|" + name] || 0) - (sold[X + "|" + name] || 0);
-    if (!bo.noCap) q = Math.min(q, bo.quantity - (DONE.bought[bo.key] || 0) - (bought[bo.key] || 0));
+    q = Math.min(q, demandRoom(Y, bo, name, j, salesAt(Y)));
     if (Ys.balance !== "infinite" && bo.price > 0) q = Math.min(q, Math.floor(((Ys.balance || 0) - (DONE.money[Y] || 0) - (paid[Y] || 0)) / bo.price));
     q = Math.min(q, storeRoom(Y, name, storedAt(Y), bo));
     for (let k = i; k < j; k++) {
@@ -604,6 +639,7 @@ function packRun(run) {
     for (let k = j; k < L; k++) cash[k] += revenue - cost;
     sold[X + "|" + name] = (sold[X + "|" + name] || 0) + q; bought[bo.key] = (bought[bo.key] || 0) + q; paid[Y] = (paid[Y] || 0) + q * bo.price;
     storedAt(Y)[name] = (storedAt(Y)[name] || 0) + q;
+    salesAt(Y).push({ stop: j, key: bo.key, item: name, qty: q });
     picks.push({ i, j, cost, revenue, line: { item: name, qty: q, buy: cost / q, list: so.price, sellKey: so.key, sell: bo.price, profit: revenue - cost, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown } });
   }
   const legs = run.legs.map((l, k) => {
@@ -617,7 +653,7 @@ function packRun(run) {
     g.load.push(p.line); g.cost += p.cost; g.revenue += p.revenue;
   }
   let st = DONE;
-  for (const p of picks) st = apply(st, path[p.i], path[p.j], [p.line], p.revenue);
+  for (const p of picks) st = apply(st, path[p.i], path[p.j], [p.line], p.revenue, p.j);
   return { ...run, legs, side, st, profit: picks.reduce((n, p) => n + p.revenue - p.cost, 0) };
 }
 // The better of joint packing and the leg-by-leg fill (+ side deals in leftover space); packing is greedy too, so keep both.
@@ -657,7 +693,7 @@ function directDeals(startPos) {
       const it = itemInfo(name);
       const cap = Math.min(S.slots * stackOf(name), it.weightKg > 0 ? Math.floor(S.maxWeightKg / it.weightKg) : Infinity);
       const limits = { "A stock": so.quantity - (DONE.sold[X + "|" + name] || 0),
-        "B wants": bo.noCap ? Infinity : bo.quantity - (DONE.bought[bo.key] || 0),
+        "B wants": demandRoom(Y, bo, name, 0, DONE.sales?.[Y] || []),
         "B money": B.balance === "infinite" ? Infinity : Math.floor(((B.balance || 0) - (DONE.money[Y] || 0)) / bo.price),
         "B storage": storeRoom(Y, name, DONE.stored[Y], bo),
         "your cash": so.price > 0 ? Math.floor(S.cash / so.price) : Infinity, "vehicle": cap };
@@ -779,8 +815,12 @@ async function checkTrack() {
     let due = 0;
     for (const { item, tag, lines } of offers.values()) {
       const o = (s.Buys || []).find(x => (x.Item ?? null) === item && (x.Tag ?? null) === tag), what = item ? pretty(item) : "any " + tag;
-      const qty = lines.reduce((n, l) => n + l.qty, 0);
       if (!o) { say(k, "bad", `${name} no longer buys ${what}`); continue; }
+      // Sales at this shop at stops before this one (still ahead) fill this offer too when it takes their items.
+      const takes = it => o.Item ? o.Item === it : (itemInfo(it).tags || []).some(t => norm(t) === norm(o.Tag));
+      let earlier = 0;
+      for (let k2 = TRACK.at + 1; k2 < k; k2++) if (TRACK.path[k2] === TRACK.path[k]) for (const l2 of TRACK.stops[k2].sell) if (takes(l2.item)) earlier += l2.qty;
+      const qty = lines.reduce((n, l) => n + l.qty, 0) + earlier;
       if (o.HasPrice === false) { say(k, "bad", `${name} has taken the price off ${what}: it can't be sold there`); continue; }
       const take = o.CanAccept ?? Infinity;
       if (take <= 0) say(k, "bad", `${name} doesn't take any more ${what} (you bring ${fmt(qty, 0)})`);
@@ -1423,7 +1463,20 @@ function runStops(r) {
   r.legs.forEach((leg, k) => leg.load.forEach(l => { buy(k, l, k + 1); stops[k + 1].sell.push(l); }));
   r.side.forEach(sd => sd.load.forEach(l => { buy(sd.fromStop, l, sd.toStop); stops[sd.toStop].sell.push(l); }));
   for (const s of stops) for (const b of s.buy) b.parts.sort((x, y) => x.to - y.to);
+  for (const s of stops) s.sell.sort((a, b) => !!b.viaTag - !!a.viaTag);   // tag offers first: the safe order when selling in parts
   return stops;
+}
+// When one of a stop's sales also counts toward another offer it sells to (Fiddleheads count as Greens), selling them in
+// separate trades in the wrong order uses up the other offer's demand. One trade, or the tag offer first, is safe.
+function sellOrderNote(Y, sells) {
+  const clash = [];
+  for (const a of sells) {
+    const o = offerOf(Y, a.offer);
+    if (!o || o.noCap || !o.tag) continue;
+    const others = [...new Set(sells.filter(b => b.offer !== a.offer && takesItem(o, b.item)).map(b => pretty(b.item)))];
+    if (others.length) clash.push(`the ${o.tag} offer also takes ${others.join(", ")}`);
+  }
+  return clash.length ? `<div class="order">Sell these in one trade, or the “as …” lines first: ${esc(clash.join("; "))}, and selling those separately first uses up its demand.</div>` : "";
 }
 function runCard(r) {
   const stops = runStops(r);
@@ -1456,6 +1509,7 @@ function runCard(r) {
   r.path.forEach((id, k) => {
     const leg = r.legs[k], legAttr = leg ? ` data-leg="${k}" style="--leg:${legColor(k)}"` : "";
     html += `<div class="stop"${legAttr}><div class="stop-head"><span class="n">${k + 1}</span>${shopName(id)}</div>` +
+      sellOrderNote(id, stops[k].sell) +
       stops[k].sell.map(l => line("sell", l, k)).join("") + stops[k].buy.map(l => line("buy", l, k)).join("") + `</div>`;
     if (leg) html += `<div class="drive"${legAttr}><span class="legtag">→ ${k + 2}</span> · ${fmt(leg.minutes - S.stopMinutes)} min${roadText(BYID[leg.from], BYID[leg.to])} · cargo ${leg.slots}/${S.slots} slots, ${fmt(leg.w, 0)} kg</div>`;
   });

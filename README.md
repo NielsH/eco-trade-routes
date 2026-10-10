@@ -31,6 +31,10 @@ point it elsewhere with `?server=https://your.server`.
 - **Storage space** at a buyer: the server's dry run of each delivery (per item, also for tag offers like "any Wood"),
   plus the store's free slots shared by everything one run sells there. A store whose storage only takes non-carried
   items gets no logs, whatever its offer says.
+- **Shared demand**: a buy offer wants its limit minus the shop's stock of every item it takes, whichever offer they
+  were sold to, so Fiddleheads sold to a Fiddleheads offer also fill an "any Greens" offer. Sales at earlier stops
+  count against every offer that takes their items. Within a stop the card lists tag offers first and says when the
+  order matters: sell those lines in one trade, or the "as …" lines first.
 - **Track this run** pins the run above the list and checks its shops every minute: for the stops still ahead, is the
   shop open, does the seller still have the stock at that price, does the buyer still want your amount at that price,
   with the money and room for it. Problems show in the panel, in the tab title and (if you allow it) as a desktop
