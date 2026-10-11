@@ -205,7 +205,9 @@ function fillMe() {
   $("meList").innerHTML = [...names].sort((a, b) => a.localeCompare(b)).map(n => `<option value="${esc(n)}">`).join("");
   if (document.activeElement !== $("me")) $("me").value = store.get("me", "");
 }
+let lawRetry = null;
 async function loadLaws() {
+  clearTimeout(lawRetry);
   const player = lawPlayer();
   if (!player || S.laws === false) { LAW = null; replan(); return; }
   try {
@@ -217,7 +219,11 @@ async function loadLaws() {
       for (const e of st.Effects || []) byOffer.set(`${st.Id}/${e.Offer}|${e.Item}`, e);
     }
     LAW = { player: r.Player, byOffer, salesTax, laws: r.TradeLaws || [], at: r.GeneratedAt };
-  } catch (e) { LAW = { player, error: String(e.message || e), byOffer: new Map(), salesTax: {} }; }   // older RecipeApi or unknown player
+  } catch (e) {
+    LAW = { player, error: String(e.message || e), byOffer: new Map(), salesTax: {} };   // older RecipeApi or unknown player
+    // 503: the server has just started and is still placing stores in settlements; the laws are there in a few seconds.
+    if (/HTTP 503/.test(LAW.error)) lawRetry = setTimeout(loadLaws, 10000);
+  }
   replan();
 }
 let LIVE_VEHICLES = null;   // /vehicles: placed vehicles with real cargo storage; null on servers without the route
