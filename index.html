@@ -841,8 +841,58 @@ function startTracking(r) {
     started: Date.now(), checked: null, dataAt: null, problems: [], told: [] };
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
   trackOpen.clear();
-  saveTrack(); trackProgress(); checkTrack(); scheduleTrack();
+  if (!FEED.running) FEED.since = -1;   // start from now; a poll still running from before already is
+  saveTrack(); trackProgress(); checkTrack(); scheduleTrack(); followTrades();
 }
+// Live trades (newer RecipeApi /trades, a long poll: the server answers the moment a store trade happens). Your own trades tick
+// off the lines of the stop you're at, so they never look like problems; someone else's trade at a shop ahead on the run, on an
+// item you plan to trade there, is flagged at once and the shops are checked again as soon as the server's data catches up.
+const left = l => Math.max(0, l.qty - (l.done || 0) - 0.5) > 0 ? l.qty - (l.done || 0) : 0;   // still to trade on a line (rounding forgiven)
+const FEED = { since: -1, running: false, state: null };   // state: null (starting), "live", "unavailable", "retrying"
+const sameName = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
+async function followTrades() {
+  if (FEED.running) return;
+  FEED.running = true;
+  while (TRACK) {
+    try {
+      const r = await fetch(`${API}/trades?since=${FEED.since}&wait=25`, { cache: "no-store" });
+      if (r.status === 404) { FEED.state = "unavailable"; renderTrack(); break; }   // older RecipeApi
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const page = await r.json();
+      const first = FEED.since < 0;
+      FEED.since = page.Seq; FEED.state = "live";
+      if (!first && TRACK) onTrades(page.Trades || []);
+      renderTrack();
+    } catch (e) { FEED.state = "retrying"; renderTrack(); await new Promise(res => setTimeout(res, 10000)); }
+  }
+  FEED.running = false;
+}
+function onTrades(trades) {
+  const me = TRACK.player || store.get("me", ""), t = TRACK;
+  for (const tr of trades) {
+    const buying = tr.Side === "Buying", lineOf = st => (buying ? st.buy : st.sell).find(l => l.item === tr.Item && left(l) > 0);
+    // The stop this trade belongs to: the first one ahead (or the one you're at) at that shop with a line still open for it.
+    let k = -1;
+    for (let i = Math.max(0, t.at); i < t.path.length && k < 0; i++) if (t.path[i] === tr.Store && lineOf(t.stops[i])) k = i;
+    if (k < 0) continue;
+    if (sameName(tr.Player, me)) {
+      const line = lineOf(t.stops[k]);
+      line.done = (line.done || 0) + tr.Quantity;
+      if (t.at < k - 1) t.at = k - 1;   // you're at stop k, so the ones before are done
+      const st = t.stops[k];
+      if ([...st.buy, ...st.sell].every(l => left(l) <= 0)) setTrackAt(k);   // everything here traded: on to the next stop
+      t.events = [{ at: Date.now(), mine: true, text: `You ${buying ? "bought" : "sold"} ${fmt(tr.Quantity, 0)} ${pretty(tr.Item)} at ${t.names[k]}` }, ...(t.events || [])].slice(0, 6);
+    } else if (k > t.at) {
+      const text = `${tr.Player || "Someone"} just ${buying ? "bought" : "sold"} ${fmt(tr.Quantity, 0)} ${pretty(tr.Item)} at ${t.names[k]} (your stop ${k + 1})`;
+      t.events = [{ at: Date.now(), mine: false, stop: k, text }, ...(t.events || [])].slice(0, 6);
+      if ("Notification" in window && Notification.permission === "granted") try { new Notification("Trade run: heads up", { body: text, tag: "trade-feed" }); } catch (e) {}
+      // /shops is rebuilt once a minute: check again when it has caught up with this trade.
+      if (!t.recheckAt) { t.recheckAt = Date.now() + 62000; setTimeout(() => { if (TRACK) checkTrack(); }, 62000); }
+    }
+  }
+  saveTrack(); renderTrack();
+}
+
 function stopTracking() { TRACK = null; saveTrack(); clearInterval(trackTimer); trackTimer = null; document.title = "Trade Route Planner"; renderTrack(); }
 function saveTrack() { store.set("track", TRACK); }
 function scheduleTrack() { clearInterval(trackTimer); trackTimer = TRACK ? setInterval(checkTrack, TRACK_POLL_MS) : null; }
@@ -868,10 +918,11 @@ async function checkTrack() {
     if (!s || s.Error) return say(k, "bad", `${name} isn't in the shop list any more`);
     if (!s.On || !s.Enabled) return say(k, "bad", `${name} is closed`);
     for (const b of st.buy) {
+      if (left(b) <= 0) continue;   // bought already (the trade feed saw you do it)
       const o = (s.Sells || []).find(x => x.Item === b.item && x.Price >= 0);
       if (o && o.HasPrice === false) { say(k, "bad", `${name} has taken the price off ${pretty(b.item)}: it can't be bought`); continue; }
-      if (!o || o.Available <= 0) say(k, "bad", `${name} has no ${pretty(b.item)} left (you need ${fmt(b.qty, 0)})`);
-      else if (o.Available < b.qty) say(k, "warn", `${name} has only ${fmt(o.Available, 0)} of the ${fmt(b.qty, 0)} ${pretty(b.item)}`);
+      if (!o || o.Available <= 0) say(k, "bad", `${name} has no ${pretty(b.item)} left (you need ${fmt(left(b), 0)})`);
+      else if (o.Available < left(b)) say(k, "warn", `${name} has only ${fmt(o.Available, 0)} of the ${fmt(left(b), 0)} ${pretty(b.item)}`);
       if (o && b.needFresh > 0) {
         const worst = o.Durability ? o.Durability.Min : o.MinDurability;
         if (worst != null && worst >= 0 && Math.round(worst) < b.needFresh)
@@ -882,6 +933,7 @@ async function checkTrack() {
     }
     const offers = new Map();   // our sales per buy offer: an offer's demand is shared by all items it takes
     for (const l of st.sell) {
+      if (left(l) <= 0) continue;   // sold already
       const key = (l.offerItem || "") + "|" + (l.tag || "");
       if (!offers.has(key)) offers.set(key, { item: l.offerItem, tag: l.tag, lines: [] });
       offers.get(key).lines.push(l);
@@ -893,23 +945,24 @@ async function checkTrack() {
       // Sales at this shop at stops before this one (still ahead) fill this offer too when it takes their items.
       const takes = it => o.Item ? o.Item === it : (itemInfo(it).tags || []).some(t => norm(t) === norm(o.Tag));
       let earlier = 0;
-      for (let k2 = TRACK.at + 1; k2 < k; k2++) if (TRACK.path[k2] === TRACK.path[k]) for (const l2 of TRACK.stops[k2].sell) if (takes(l2.item)) earlier += l2.qty;
-      const qty = lines.reduce((n, l) => n + l.qty, 0) + earlier;
+      for (let k2 = TRACK.at + 1; k2 < k; k2++) if (TRACK.path[k2] === TRACK.path[k]) for (const l2 of TRACK.stops[k2].sell) if (takes(l2.item)) earlier += left(l2);
+      const qty = lines.reduce((n, l) => n + left(l), 0) + earlier;
       if (o.HasPrice === false) { say(k, "bad", `${name} has taken the price off ${what}: it can't be sold there`); continue; }
       const take = o.CanAccept ?? Infinity;
       if (take <= 0) say(k, "bad", `${name} doesn't take any more ${what} (you bring ${fmt(qty, 0)})`);
       else if (take < qty) say(k, "warn", `${name} now takes only ${fmt(take, 0)} of your ${fmt(qty, 0)} ${what}`);
       for (const l of lines) {
         const room = o.CanStoreItems ? o.CanStoreItems[l.item] : null;
-        if (room != null && room < l.qty && take > 0) say(k, room <= 0 ? "bad" : "warn", `${name} has room for ${fmt(room, 0)} of your ${fmt(l.qty, 0)} ${pretty(l.item)}`);
+        if (room != null && room < left(l) && take > 0) say(k, room <= 0 ? "bad" : "warn", `${name} has room for ${fmt(room, 0)} of your ${fmt(left(l), 0)} ${pretty(l.item)}`);
         if (o.Price < l.price - 1e-9) say(k, "warn", `${name} now pays ${fmt(o.Price, 2)} for ${pretty(l.item)} (was ${fmt(l.price, 2)})`);
-        due += l.qty * Math.min(l.price, o.Price);
+        due += left(l) * Math.min(l.price, o.Price);
       }
     }
     const spendable = Math.max(0, (s.Balance ?? 0) - (s.MinimumBalance || 0));   // buy offers never pay below the owner's floor (0.14.2)
     if (due > 0 && !s.UnlimitedBalance && spendable < due - 1e-6) say(k, spendable <= 0 ? "bad" : "warn", `${name} has ${fmt(spendable)} ${TRACK.currency} left to spend, your sale there is ${fmt(due)}`);
   });
   TRACK.error = null; TRACK.problems = problems; TRACK.checked = Date.now(); TRACK.dataAt = data.GeneratedAt;
+  TRACK.recheckAt = null;
   const fresh = problems.filter(p => !TRACK.told.includes(p.key));
   if (fresh.length && "Notification" in window && Notification.permission === "granted") {
     try { new Notification(`Trade run: ${fresh.length} problem${fresh.length > 1 ? "s" : ""} ahead`, { body: fresh.map(p => `Stop ${p.stop + 1}: ${p.text}`).join("\n"), tag: "trade-track" }); } catch (e) {}
@@ -931,14 +984,20 @@ function renderTrack() {
   let html = `<div class="head"><span class="fold" data-fold title="${folded ? "Show the stops" : "Fold"}">${folded ? "▸" : "▾"} Tracking +${fmt(t.profit)} ${esc(t.currency)}` +
     ` <span class="${bad ? "bad" : t.problems.length ? "warn" : "okline"}" style="font-weight:600">· ${status}</span></span><button class="tiny" data-untrack>Stop tracking</button></div>`;
   if (folded) { el.innerHTML = html; bindTrack(el); return; }
-  html += `<div class="sub">${t.checked ? `Checked ${time(t.checked)}` : "Checking…"} · every minute${t.player ? ` · following ${esc(t.player)}` : " · tick stops off as you go"}</div>`;
+  const me = t.player || store.get("me", "");
+  const live = FEED.state === "live" ? (me ? ` · trades live: yours tick off as ${esc(me)} trades` : " · trades live (set Your player to tick yours off)")
+    : FEED.state === "unavailable" ? " · no live trades on this server" : FEED.state === "retrying" ? " · reconnecting to live trades…" : "";
+  html += `<div class="sub">${t.checked ? `Checked ${time(t.checked)}` : "Checking…"} · every minute${live}${!me && t.player == null ? " · tick stops off as you go" : ""}</div>`;
+  for (const e of (t.events || []).filter(e => Date.now() - e.at < 15 * 60000).slice(0, 3))
+    html += `<div class="${e.mine ? "okline" : "warn"}">${e.mine ? "✓" : "⚠"} ${esc(e.text)} <span class="sub">${time(e.at)}</span></div>`;
   if (t.error) html += `<div class="warn">Couldn't check: ${esc(t.error)}</div>`;
   t.path.forEach((id, k) => {
     const st = t.stops[k], done = k <= t.at, probs = t.problems.filter(p => p.stop === k), next = k === t.at + 1;
     const mark = done ? "✓" : probs.some(p => p.level === "bad") ? "⛔" : probs.length ? "⚠" : next ? "▶" : "○";
     const open = trackOpen.get(k) ?? (!done && (next || probs.length > 0));
     const count = [st.sell.length && `sell ${st.sell.length}`, st.buy.length && `buy ${st.buy.length}`].filter(Boolean).join(" · ") + " items";
-    const what = [...st.sell.map(l => `sell ${fmt(l.qty, 0)} ${pretty(l.item)}`), ...st.buy.map(b => `buy ${fmt(b.qty, 0)} ${pretty(b.item)}`)].join(", ");
+    const part = (verb, l) => `${verb} ${l.done ? (left(l) <= 0 ? "✓ " : `${fmt(l.done, 0)}/`) : ""}${fmt(l.qty, 0)} ${pretty(l.item)}`;
+    const what = [...st.sell.map(l => part("sell", l)), ...st.buy.map(b => part("buy", b))].join(", ");
     html += `<div class="tstop${done ? " done" : ""}"><span class="mark">${mark}</span><span><span class="name" data-track-open="${k}" title="${open ? "Hide" : "Show"} the items">${k + 1}. ${esc(t.names[k])}</span>` +
       (open ? `<br><span class="what">${esc(what)}</span>` : `<span class="count">${count}</span>`) +
       probs.map(p => `<br><span class="${p.level}">${esc(p.text)}</span>`).join("") + `</span>` +
@@ -1656,7 +1715,7 @@ initForm();
 new ResizeObserver(resize).observe(cv);
 loadMap(); load();
 startPlayerPoll();
-if (TRACK) { renderTrack(); checkTrack(); scheduleTrack(); }
+if (TRACK) { renderTrack(); checkTrack(); scheduleTrack(); followTrades(); }
 $("refresh").addEventListener("click", loadMap);
 </script>
 </body>

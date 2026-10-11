@@ -50,7 +50,9 @@ point it elsewhere with `?server=https://your.server`.
   shop open, does the seller still have the stock at that price, does the buyer still want your amount at that price,
   with the money and room for it. Problems show in the panel, in the tab title and (if you allow it) as a desktop
   notification. Stops you've done are skipped so your own trades don't count: with your player as the start, reaching
-  the next stop ticks it off; otherwise tick stops off yourself.
+  the next stop ticks it off; otherwise tick stops off yourself. With a newer RecipeApi the panel also follows live trades (a long poll on
+  `/trades`): your own trades (as "Your player") tick off lines and stops the moment you make them, so they never show as
+  problems, and someone else's trade at a shop ahead on an item you plan to trade there is flagged at once.
 - **Continue from <last stop>** plans the next run from where this one ends, assuming its trades happened.
   **Refresh** reloads the real state.
 - **Vehicle**: your own placed vehicles (when you picked your player), every vehicle type placed on the server, and a
