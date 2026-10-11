@@ -143,6 +143,8 @@ table.offers { width: 100%; border-collapse: collapse; font-size: 12px; margin-t
           <label>Min legs<input id="minLegs" type="number" min="1" max="8"></label>
           <label style="grid-column: span 2">Currency<select id="currency"></select></label>
           <label>Stop min<input id="stopMin" type="number" min="0" step="0.5"></label>
+          <label title="Who you are on the server: laws and your own vehicles are looked up for this player, online or not. Choosing your player as the start sets it too.">Your player<input id="me" list="meList" autocomplete="off" placeholder="name"><datalist id="meList"></datalist></label>
+          <label title="Include what the server's laws pay or charge you per trade (e.g. transport incentives) and the stores' sales tax. Needs your player.">Laws & tax<select id="laws"><option value="on">included</option><option value="off">ignored</option></select></label>
           <label title="Minutes to pack up one vehicle, place the other and move the cargo across, each time a route switches between land and boat">Switch min<input id="switchMin" type="number" min="0" step="0.5"></label>
           <label>Road factor<input id="routeFactor" type="number" min="1" step="0.1"></label>
           <label>Bonus %<input id="bonus" type="number" min="0" step="1"></label>
@@ -192,6 +194,32 @@ const store = { get(k, d) { try { const v = localStorage.getItem("trade." + k); 
 
 // ---------------- state ----------------
 let SHOPS = [], BYID = {}, ITEMS = {}, PLAYERS = [], RUNS = [], DEALS = [], M = null;
+// Laws and sales tax (newer RecipeApi /incentives): what the server's laws pay or charge THIS player per store offer, evaluated by
+// the server's own law engine, and each store's sales tax. Money the store prices don't show: a transport incentive can make a
+// trade at the same price worth doing. Needs a player: the start player, or the one last chosen.
+let LAW = null;   // { player, byOffer: Map("offerKey|Item" -> effect), salesTax: { shopId: rate }, laws: [...] }
+const lawPlayer = () => start?.kind === "player" ? start.name : store.get("me", "");
+// The "Your player" field: names to pick from are the online players and the shop owners (players need not be online).
+function fillMe() {
+  const names = new Set([...(PLAYERS || []).map(p => p.Name), ...SHOPS.map(s => s.owner).filter(Boolean)]);
+  $("meList").innerHTML = [...names].sort((a, b) => a.localeCompare(b)).map(n => `<option value="${esc(n)}">`).join("");
+  if (document.activeElement !== $("me")) $("me").value = store.get("me", "");
+}
+async function loadLaws() {
+  const player = lawPlayer();
+  if (!player || S.laws === false) { LAW = null; replan(); return; }
+  try {
+    const r = await getJSON(API + "/incentives?player=" + encodeURIComponent(player));
+    const byOffer = new Map(), salesTax = {};
+    for (const st of r.Stores || []) {
+      if (st.Error) continue;
+      salesTax[st.Id] = st.SalesTax || 0;
+      for (const e of st.Effects || []) byOffer.set(`${st.Id}/${e.Offer}|${e.Item}`, e);
+    }
+    LAW = { player: r.Player, byOffer, salesTax, laws: r.TradeLaws || [], at: r.GeneratedAt };
+  } catch (e) { LAW = { player, error: String(e.message || e), byOffer: new Map(), salesTax: {} }; }   // older RecipeApi or unknown player
+  replan();
+}
 let LIVE_VEHICLES = null;   // /vehicles: placed vehicles with real cargo storage; null on servers without the route
 let start = store.get("start", null);   // null | {kind:"pos", x, z, label} | {kind:"shop", id} | {kind:"player", name}
 let tab = "runs", selected = null, hoverShop = null, hoverLeg = null, picking = false, loadedAt = null;
@@ -259,9 +287,10 @@ async function load() {
     LIVE_VEHICLES = vehicles.Vehicles && vehicles.Vehicles.filter(v => !v.Error);
     const previousData = loadedAt;
     loadedAt = shops.GeneratedAt;
-    fillCurrencies(); fillPlayers(); fillVehicles();
+    fillCurrencies(); fillPlayers(); fillVehicles(); fillMe();
     tradeCheck = reconcile(previousData === loadedAt);
     replan();
+    loadLaws();   // fresh shop data: the laws' amounts follow offer prices
   } catch (e) {
     $("status").innerHTML = `<span class="err">Could not load from ${esc(SERVER)}: ${esc(e.message)}</span>`;
     $("list").innerHTML = `<div class="status err">${esc(e.message)}</div>`;
@@ -421,6 +450,17 @@ function freshnessOk(so, bo, name, minutes) {
   return true;
 }
 
+// What laws and sales tax add to one trade line for the player (negative: they cost): the law effect of buying at X and of
+// selling at Y (per unit + per line), minus the sales tax the customer pays at both stores on the value traded.
+const lawEffect = (offerKey, name) => S.laws !== false && LAW ? LAW.byOffer.get(offerKey + "|" + name) : null;
+function lawMoney(X, so, Y, bo, name, q, cost) {
+  if (!LAW || S.laws === false) return 0;
+  let m = 0;
+  for (const e of [lawEffect(so.key, name), lawEffect(bo.key, name)]) if (e) m += e.PerUnit * q + (q > 0 ? e.Fixed : 0);
+  return m - (LAW.salesTax[X] || 0) * cost - (LAW.salesTax[Y] || 0) * q * bo.price;
+}
+const lawBlocked = (so, bo, name) => !!(lawEffect(so.key, name)?.Blocked || lawEffect(bo.key, name)?.Blocked);
+
 function buildMarket() {
   const open = SHOPS.filter(s => s.on && s.enabled && s.currency && s.currency === S.currency);
   const byId = Object.fromEntries(open.map(s => [s.id, s]));
@@ -434,10 +474,11 @@ function buildMarket() {
       if (bo.quantity <= 0) continue;
       for (const name of bo.item ? [bo.item] : (bo.tagItems || [])) {   // a tag offer takes any item in its tag, sharing one limit
         const so = sells[X.id][name];
-        if (!so || !fits(name) || !freshnessOk(so, bo, name, 0)) continue;
+        if (!so || !fits(name) || !freshnessOk(so, bo, name, 0) || lawBlocked(so, bo, name)) continue;
         // unit ranks the candidate: the margin at the list price, or at the best discount for a deal that only pays with one
         // (each lot is then priced by its real quantity and dropped if that doesn't reach the tier).
-        const unit = bo.price * (1 + S.bonus) - so.price, best = bo.price * (1 + S.bonus) - bestPrice(so);
+        const law = lawMoney(X.id, so, Y.id, bo, name, 100, 100 * so.price) / 100;   // per unit, at a typical lot
+        const unit = bo.price * (1 + S.bonus) - so.price + law, best = bo.price * (1 + S.bonus) - bestPrice(so) + law;
         if (best > 0) m.push({ name, so, bo, unit: unit > 0 ? unit : best });
       }
     }
@@ -522,7 +563,7 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash, stopTo) {
   const load = [], partial = {}, taken = {}, used = {};   // taken: per buy offer; used: per item of the seller's stock (two offers can want one item)
   const stored = { ...(st.stored?.[Y]) };                  // what's in the buyer's storage from this plan, this leg included
   const sales = [...(st.sales?.[Y] || [])];               // the run's sales to this shop so far, this leg included
-  let usedSlots = 0, usedW = 0, cost = 0, revenue = 0;
+  let usedSlots = 0, usedW = 0, cost = 0, revenue = 0, law = 0;
   const tripMinutes = legMinutes(X, Y);
   for (const { name, so, bo, unit } of cands) {
     const it = itemInfo(name);
@@ -538,18 +579,18 @@ function fill(X, Y, st, slotsLeft, weightLeft, cash, stopTo) {
     const payable = bo.price > 0 ? Math.floor((yMoney - revenue) / bo.price) : Infinity;
     q = Math.floor(Math.min(q, roomSlots, roomW, afford, payable, storeRoom(Y, name, stored, bo)));
     if (!(q > 0)) continue;
-    const lotCost = lineCost(so, q), lotRevenue = q * bo.price * (1 + S.bonus);
-    if (lotRevenue - lotCost <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
+    const lotCost = lineCost(so, q), lotRevenue = q * bo.price * (1 + S.bonus), lotLaw = lawMoney(X, so, Y, bo, name, q, lotCost);
+    if (lotRevenue - lotCost + lotLaw <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
     stored[name] = (stored[name] || 0) + q;
     sales.push({ stop: stopTo, key: bo.key, item: name, qty: q });
     const newTotal = q - (partial[name] || 0);
     usedSlots += Math.max(0, Math.ceil(newTotal / stack));
     partial[name] = mod(-newTotal, stack);
-    usedW += q * it.weightKg; cost += lotCost; revenue += lotRevenue;
+    usedW += q * it.weightKg; cost += lotCost; revenue += lotRevenue; law += lotLaw;
     taken[bo.key] = (taken[bo.key] || 0) + q; used[name] = (used[name] || 0) + q;
-    load.push({ item: name, qty: q, buy: lotCost / q, list: so.price, sellKey: so.key, sell: bo.price, profit: lotRevenue - lotCost, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown });
+    load.push({ item: name, qty: q, buy: lotCost / q, list: so.price, sellKey: so.key, sell: bo.price, profit: lotRevenue - lotCost + lotLaw, law: lotLaw, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown });
   }
-  return { load, slots: usedSlots, w: usedW, cost, revenue };
+  return { load, slots: usedSlots, w: usedW, cost, revenue, law };
 }
 
 function apply(st, X, Y, load, revenue, stopTo) {
@@ -581,7 +622,7 @@ function plan(startPos) {
         if (!isFinite(mins)) continue;   // unreachable without crossing water
         next.push({ path: [...b.path, Y], lead: b.lead,
           legs: [...b.legs, { from: X, to: Y, load: f.load, slots: f.slots, w: f.w, cost: f.cost, revenue: f.revenue, minutes: mins }],
-          profit: b.profit + f.revenue - f.cost, minutes: b.minutes + mins, cash: b.cash - f.cost + f.revenue, st: apply(b.st, X, Y, f.load, f.revenue, b.path.length) });
+          profit: b.profit + f.revenue - f.cost + f.law, minutes: b.minutes + mins, cash: b.cash - f.cost + f.revenue, st: apply(b.st, X, Y, f.load, f.revenue, b.path.length) });
       }
     }
     next.sort((a, b) => b.profit / b.minutes - a.profit / a.minutes);
@@ -613,7 +654,7 @@ function sideDeals(run) {
     for (let k = i; k < j; k++) { legs[k].slots += f.slots; legs[k].w += f.w; cashAt[k] -= f.cost; }
     st = apply(st, path[i], path[j], f.load, f.revenue, j);
     side.push({ from: path[i], to: path[j], fromStop: i, toStop: j, load: f.load, cost: f.cost, revenue: f.revenue });
-    extra += f.revenue - f.cost;
+    extra += f.revenue - f.cost + f.law;
   }
   run.side = side; run.profit += extra; run.st = st;
   return run;
@@ -649,8 +690,8 @@ function packRun(run) {
     }
     q = Math.floor(q);
     if (!(q > 0)) continue;
-    const cost = lineCost(so, q), revenue = q * bo.price * (1 + S.bonus);
-    if (revenue - cost <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
+    const cost = lineCost(so, q), revenue = q * bo.price * (1 + S.bonus), law = lawMoney(X, so, Y, bo, name, q, cost);
+    if (revenue - cost + law <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
     for (let k = i; k < j; k++) {
       const added = q - (partial[k][name] || 0);
       slots[k] += Math.max(0, Math.ceil(added / stack)); partial[k][name] = mod(-added, stack);
@@ -660,7 +701,7 @@ function packRun(run) {
     sold[X + "|" + name] = (sold[X + "|" + name] || 0) + q; bought[bo.key] = (bought[bo.key] || 0) + q; paid[Y] = (paid[Y] || 0) + q * bo.price;
     storedAt(Y)[name] = (storedAt(Y)[name] || 0) + q;
     salesAt(Y).push({ stop: j, key: bo.key, item: name, qty: q });
-    picks.push({ i, j, cost, revenue, line: { item: name, qty: q, buy: cost / q, list: so.price, sellKey: so.key, sell: bo.price, profit: revenue - cost, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown } });
+    picks.push({ i, j, cost, revenue, law, line: { item: name, qty: q, buy: cost / q, list: so.price, sellKey: so.key, sell: bo.price, profit: revenue - cost + law, law, offer: bo.key, viaTag: bo.item ? null : bo.tag, unknown: !!it.unknown } });
   }
   const legs = run.legs.map((l, k) => {
     const own = picks.filter(p => p.i === k && p.j === k + 1);
@@ -674,7 +715,7 @@ function packRun(run) {
   }
   let st = DONE;
   for (const p of picks) st = apply(st, path[p.i], path[p.j], [p.line], p.revenue, p.j);
-  return { ...run, legs, side, st, profit: picks.reduce((n, p) => n + p.revenue - p.cost, 0) };
+  return { ...run, legs, side, st, profit: picks.reduce((n, p) => n + p.revenue - p.cost + p.law, 0) };
 }
 // The better of joint packing and the leg-by-leg fill (+ side deals in leftover space); packing is greedy too, so keep both.
 function bestPacking(run) {
@@ -719,7 +760,7 @@ function directDeals(startPos) {
         "your cash": so.price > 0 ? Math.floor(S.cash / so.price) : Infinity, "vehicle": cap };
       const q = Math.min(...Object.values(limits));
       if (!(q > 0)) continue;
-      const cost = lineCost(so, q), profit = q * bo.price * (1 + S.bonus) - cost;
+      const cost = lineCost(so, q), profit = q * bo.price * (1 + S.bonus) - cost + lawMoney(X, so, Y, bo, name, q, cost);
       if (profit <= 1e-9) continue;   // only pays at a discount this quantity doesn't reach
       const mins = lead + S.stopMinutes + leg;
       deals.push({ X, Y, name, q, unit: profit / q, profit, mins, rate: profit / mins, viaTag: bo.item ? null : bo.tag,
@@ -941,13 +982,15 @@ function showStatus() {
   if (S.routing === "terrain") routing = routingFailed ? "straight-line times (the map couldn't be loaded for routing)"
     : routingPending() ? routingMessage().replace("…", "").toLowerCase()
     : "routed over roads and terrain";
-  $("status").textContent = `${M.open.length} open ${S.currency} shops · ${M.pairs.size} profitable pairs · ${routing} · planned in ${fmt(lastPlanMs, 0)} ms · data ${loadedAt ? new Date(loadedAt).toLocaleTimeString() : "?"}`;
+  const laws = S.laws === false ? "laws ignored" : !lawPlayer() ? "pick your player to include laws" : !LAW ? "loading laws" : LAW.error ? "laws unavailable"
+    : `laws for ${LAW.player}: ${LAW.byOffer.size} offers affected`;
+  $("status").textContent = `${M.open.length} open ${S.currency} shops · ${M.pairs.size} profitable pairs · ${laws} · ${routing} · planned in ${fmt(lastPlanMs, 0)} ms · data ${loadedAt ? new Date(loadedAt).toLocaleTimeString() : "?"}`;
 }
 
 // ---------------- settings ----------------
 // Cargo rules of the chosen vehicle; slots/max kg/speed live in the form so they stay editable.
 let CARGO = { storages: [] };
-const FIELDS = { vehicle: "s:PoweredCart", slots: "", maxkg: "", speed: "", cash: "", legs: 4, minLegs: 1, currency: "", stopMin: 1, routeFactor: 1.3, bonus: 0, routing: "terrain", offroad: 0.5, stretch: 80, boat: "", switchMin: 1 };
+const FIELDS = { vehicle: "s:PoweredCart", slots: "", maxkg: "", speed: "", cash: "", legs: 4, minLegs: 1, currency: "", stopMin: 1, routeFactor: 1.3, bonus: 0, routing: "terrain", offroad: 0.5, stretch: 80, boat: "", switchMin: 1, laws: "on" };
 function initForm() {
   fillVehicles();
   for (const [id, d] of Object.entries(FIELDS)) if (id !== "vehicle" && id !== "boat") $(id).value = store.get("f." + id, d);
@@ -955,6 +998,8 @@ function initForm() {
   for (const id of ["vehicle", "boat"]) $(id).addEventListener("change", () => { vehicleDefaults(); saveForm(); replan(); });
   applyCargo();
   for (const id of Object.keys(FIELDS)) if (id !== "vehicle" && id !== "boat") $(id).addEventListener("change", () => { saveForm(); replan(); });
+  $("me").value = store.get("me", "");
+  $("me").addEventListener("change", () => { store.set("me", $("me").value.trim()); fillVehicles(); loadLaws(); });
 }
 // A placed vehicle's cargo. General storages (taking all or most items) count towards slots and weight; storages limited
 // to a few items (a log-only bay) only when the vehicle has nothing else. Tool buckets (skid steer, excavator, tractor)
@@ -1063,7 +1108,7 @@ function readSettings() {
     currency: $("currency").value, stopMinutes: Math.max(0, num("stopMin", 1)), routeFactor: Math.max(1, num("routeFactor", 1.3)),
     bonus: Math.max(0, num("bonus", 0)) / 100,
     routing: $("routing").value === "straight" ? "straight" : "terrain", offroad: Math.min(1, Math.max(0.05, num("offroad", 0.5))),
-    stretch: Math.max(0, num("stretch", 80)), switchMin: Math.max(0, num("switchMin", 1)),
+    stretch: Math.max(0, num("stretch", 80)), switchMin: Math.max(0, num("switchMin", 1)), laws: $("laws").value !== "off",
     roadMult: (vehicleSpec($("vehicle").value) || {}).roadMult ?? 1, water: !!(vehicleSpec($("vehicle").value) || {}).water,
   });
   S.wrap = S.water;   // the world wraps; only boats can cross the edge (it's ocean), so straight lines wrap for boats only
@@ -1087,7 +1132,11 @@ function fillPlayers() {
 }
 
 // ---------------- start ----------------
-function setStart(s) { start = s; store.set("start", s); if (s?.kind === "player") { store.set("me", s.name); anchorPlayerStart(); fillVehicles(); } picking = false; updatePickUi(); replan(); }
+function setStart(s) {
+  const before = lawPlayer();
+  start = s; store.set("start", s); if (s?.kind === "player") { store.set("me", s.name); $("me").value = s.name; anchorPlayerStart(); fillVehicles(); } picking = false; updatePickUi(); replan();
+  if (lawPlayer() !== before) loadLaws();   // laws depend on who trades
+}
 function renderStart() {
   const sp = startPosition();
   let t = "anywhere (runs begin at their first shop)";
@@ -1547,6 +1596,8 @@ function runCard(r) {
       else if (l.parts[0].to > k + 1 || l.parts[0].viaTag) notes.push(part(l.parts[0]).replace("for the next stop as", "as"));
     }
     if (verb === "buy" && l.list > l.buy + 1e-9) notes.push(`−${fmt(100 * (1 - l.buy / l.list), 0)}% for ${fmt(l.qty, 0)} (list ${fmt(l.list, 2)})`);
+    const lawE = verb === "buy" ? lawEffect(l.sellKey, l.item) : lawEffect(l.offer, l.item);
+    if (lawE && lawE.PerUnit) notes.push(`${lawE.PerUnit > 0 ? "+" : "−"}${fmt(Math.abs(lawE.PerUnit), 2)} ea by law${lawE.Deferred ? ", paid later" : ""}`);
     if (verb === "buy") {   // how fresh (or worn) what you get is
       const so = (BYID[r.path[k]]?.sells || []).find(o => o.key === l.sellKey);
       if (so?.stockDur) notes.push(so.stockDur.Min === so.stockDur.Max ? `${fmt(so.stockDur.Min, 0)}% fresh` : `${fmt(so.stockDur.Min, 0)}–${fmt(so.stockDur.Max, 0)}% fresh`);
@@ -1576,7 +1627,8 @@ function runCard(r) {
       stops[k].sell.map(l => line("sell", l, k)).join("") + stops[k].buy.map(l => line("buy", l, k)).join("") + `</div>`;
     if (leg) html += `<div class="drive"${legAttr}><span class="legtag">→ ${k + 2}</span> · ${fmt(leg.minutes - S.stopMinutes)} min${roadText(BYID[leg.from], BYID[leg.to])} · cargo ${leg.slots}/${S.slots} slots, ${fmt(leg.w, 0)} kg</div>`;
   });
-  html += `<div class="summary">Profit <b>+${fmt(r.profit)} ${esc(S.currency)}</b> · ${fmt(r.minutes)} min incl. ${fmt(S.stopMinutes)} min per stop · needs <b>${fmt(need)}</b> cash up front</div></div>`;
+  const fromLaws = [...r.legs, ...r.side].reduce((n, leg) => n + leg.load.reduce((m, l) => m + (l.law || 0), 0), 0);
+  html += `<div class="summary">Profit <b>+${fmt(r.profit)} ${esc(S.currency)}</b>${Math.abs(fromLaws) >= 0.05 ? ` (${fromLaws > 0 ? "incl. +" : "after −"}${fmt(Math.abs(fromLaws))} from laws and tax)` : ""} · ${fmt(r.minutes)} min incl. ${fmt(S.stopMinutes)} min per stop · needs <b>${fmt(need)}</b> cash up front</div></div>`;
   return html;
 }
 function shopDetail(s) {

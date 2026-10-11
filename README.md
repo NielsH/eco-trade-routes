@@ -31,6 +31,11 @@ point it elsewhere with `?server=https://your.server`.
 - **Storage space** at a buyer: the server's dry run of each delivery (per item, also for tag offers like "any Wood"),
   plus the store's free slots shared by everything one run sells there. A store whose storage only takes non-carried
   items gets no logs, whatever its offer says.
+- **Laws & tax** (newer RecipeApi): what the server's laws pay or charge you per trade, evaluated by the server's own law
+  engine for your player ("Your player" in the settings, online or not; choosing your player as the start sets it), plus
+  the stores' sales tax. A transport incentive can make a
+  trade at the same price worth doing; the card shows "+0.75 ea by law" (and "paid later" for SmartTax payments) and how much
+  of a run's profit comes from laws. Switch it off under "Laws & tax".
 - **Freshness** (food) and wear (tools) are durability. A purchase can hand you any stack the sell offer lets through,
   so the planner counts on the worst: the stock's lowest freshness (newer RecipeApi), else the sell offer's own minimum
   (50% by default, but sellers can lower it). Food loses freshness on the road (100% per shelf life, about 1% an hour
