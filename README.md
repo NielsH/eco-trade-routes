@@ -94,18 +94,23 @@ Travel times are routed over the real map (`routing.js`, in a background worker;
 - **Off road** is slower: the off-road speed setting (default 0.5), more so on bumpy ground (from the height map).
   Forest without a road (trees aren't on the map but block vehicles) and ground with natural 2-block steps are about 7×
   slower again, so a run only crosses them when there's no real alternative.
-- **Water** is impassable for land vehicles unless something is built on it (a bridge). Boats only move on water and
-  can reach a shop within about 12 blocks of it. The world wraps around, so a boat can sail off one edge of the
+- **Water** is impassable for land vehicles unless something is built on it (a bridge). Boats only move on the ocean
+  (sea-level water connected to the map's edge: no rivers or inland lakes) and can reach a shop within about 12 blocks
+  of it. The world wraps around, so a boat can sail off one edge of the
   map and come back on the opposite one. The map doesn't draw water, so it's inferred: riverbed, or natural
   ground below sea level.
 - **Cliffs and walls** (natural steps of 3+ blocks off road, or more than one block up per block) can't be driven.
 - **Long stretches without a road** are about 10× slower again: farther than half the "Off-road gap" setting (default 80
   blocks) from any road or built-up ground. A short hop between two patches of road costs nothing extra; a route across
   open country only wins when there's no alternative, and the run card flags such a leg.
-- **Tunnels and overpasses**: the map shows what's on top, so a road through a tunnel looks cut by a wall. Where a
-  straight road stops for at most 16 blocks under something at least 2 blocks above it, and carries on in the same line
-  on the other side at about the same height, it's assumed to continue underneath. Longer tunnels, and anything under a
-  roof, aren't visible. Shops that can't be reached are left out of runs.
+- **Tunnels, overpasses and graded tracks**: the map shows what's on top, so a road through a tunnel looks cut by a wall,
+  and a road often runs on through stretches of levelled soil or crushed rock the map doesn't show as road. Where a straight
+  road stops and carries on in the same line, the gap counts as road when it's a tunnel or overpass (up to 48 blocks,
+  covered by something 2+ blocks higher, ends at about the same height) or a levelled track (any length, as long as the
+  ground stays within 2 blocks of the line between the road ends). Both road ends must run along the line (5+ blocks, longer
+  than the road is wide), so a road crossing the line, like a parallel street, never counts; short broken bits of road inside
+  a gap belong to the gap. Never across water. Longer tunnels, roads that bend inside one, and anything under a roof aren't
+  visible. Shops that can't be reached are left out of runs.
 
 The map shows each leg along its route with its share on roads. Switch "Travel time" to "straight line × road factor"
 for the old estimate. Minutes are still estimates: the speed scale isn't calibrated against real trips yet.

@@ -28,6 +28,17 @@
 //land and water; water time is scaled by p.waterScale (land speed / boat speed) so all times stay "seconds at the land
 //vehicle's speed 1".
 //
+//Boats only use the ocean: sea-level water (natural ground below sea level, not riverbed) connected to the edge of the map.
+//Rivers and inland lakes are not routes, even where a boat would fit.
+//
+//Graded tracks: a straight road often runs on through stretches of plain ground at road height (a track that was levelled
+//but not paved, or road covered by something the map shows instead). Where a straight road stops and the ground in between
+//stays within TRACK_LEVEL blocks of the line between the two road ends, it counts as road too (players often lay such
+//stretches in crushed rock or leave them as levelled soil). Never across water. Long coincidences are rare on their own,
+//since ground seldom stays that level for long; the guard that matters is that both road ends run ALONG the line: a road
+//crossing it (a parallel street seen side-on) is not a continuation, or the space between two parallel roads would fill.
+//Gaps are filled in passes, so a road broken into many short pieces joins up before the pieces are judged.
+//
 //Tunnels and overpasses: the map shows what's on top, so a road through a tunnel or under a bridge looks cut by a wall.
 //Where a straight road stops for at most TUNNEL_GAP blocks and carries on in the same line (at least TUNNEL_RUN road
 //blocks on each side, ends within 2 blocks of each other in height) under something at least 2 blocks above it, the
@@ -46,7 +57,9 @@
   const SLOPE_COST = 2;           // extra time per block climbed per block driven
   const ROUGH_COST = 3;           // off road: slowdown per block of average step inside a cell
   const FREE_RADIUS = 3;          // cells around a shop where walls/steps don't block (getting out of the building)
-  const TUNNEL_GAP = 16, TUNNEL_RUN = 8;   // blocks: longest covered stretch of road, and the straight road needed on each side
+  const TUNNEL_GAP = 48, TUNNEL_RUN = 5;   // blocks: longest covered stretch of road, and the straight road needed on each side
+  const TRACK_LEVEL = 2;                   // blocks: how far a levelled stretch's ground may stray from the line between the road
+                                           // ends (ramps make those uneven)
 
   //---------------------------------------------------------------- worker ----------------------------------------------------------------
   function workerMain() {
@@ -287,35 +300,65 @@
     const roadAt = px => { const i = px * 4; return road.get((tp[i] << 16) | (tp[i + 1] << 8) | tp[i + 2]) || 0; };
     const isRoad = new Float32Array(size * size);
     for (let px = 0; px < size * size; px++) isRoad[px] = roadAt(px);
-    for (const [step, lines, along] of [[1, size, y => y * size], [size, size, x => x]]) {   // rows, then columns
-      for (let l = 0; l < lines; l++) {
-        const base = along(l), at = k => base + k * step;
-        let k = 0;
-        while (k < size) {
-          if (isRoad[at(k)]) { k++; continue; }
-          let e = k;
-          while (e < size && !isRoad[at(e)]) e++;                     // [k, e) is a stretch without road
-          const gap = e - k;
-          if (k > 0 && e < size && gap <= TUNNEL_GAP) {
-            let before = 0, after = 0;
-            while (before < TUNNEL_RUN && k - 1 - before >= 0 && isRoad[at(k - 1 - before)]) before++;
-            while (after < TUNNEL_RUN && e + after < size && isRoad[at(e + after)]) after++;
-            const ha = hp[at(k - 1) * 4], hb = hp[at(e) * 4];
-            let top = 0;
-            for (let j = k; j < e; j++) top = Math.max(top, hp[at(j) * 4]);
-            if (before >= TUNNEL_RUN && after >= TUNNEL_RUN && Math.abs(ha - hb) <= 2 && top >= Math.max(ha, hb) + 2) {
-              const eff = Math.min(isRoad[at(k - 1)], isRoad[at(e)]);
-              for (let j = k; j < e; j++) { tunnelEff[at(j)] = eff; tunnelH[at(j)] = ha + (hb - ha) * (j - k + 1) / (gap + 1); }
+    const hAt = px => tunnelEff[px] ? tunnelH[px] : hp[px * 4];
+    for (let pass = 0; pass < 3; pass++) {   // filled gaps count as road in the next pass, so short pieces join up
+      let changed = false;
+      for (const [step, lines, along] of [[1, size, y => y * size], [size, size, x => x]]) {   // rows, then columns
+        for (let l = 0; l < lines; l++) {
+          const base = along(l), at = k => base + k * step;
+          let k = 0;
+          while (k < size) {
+            if (isRoad[at(k)]) { k++; continue; }
+            //[k, e) is a stretch without road; a piece of road too short to count (a block or two left between gaps) is part of
+            //it, so the stretch runs on to where a real piece of road resumes.
+            let e = k, after = 0;
+            for (;;) {
+              while (e < size && !isRoad[at(e)]) e++;
+              after = 0;
+              while (after < TUNNEL_RUN && e + after < size && isRoad[at(e + after)]) after++;
+              if (after >= TUNNEL_RUN || e + after >= size) break;
+              e += after;
             }
+            const gap = e - k;
+            if (k > 0 && e < size) {
+              //How far the road at each end runs along the line, and how wide it is across it (at most 12 counted).
+              let before = 0, along = 0;
+              while (before < 12 && k - 1 - before >= 0 && isRoad[at(k - 1 - before)]) before++;
+              while (along < 12 && e + along < size && isRoad[at(e + along)]) along++;
+              const across = px => {
+                const x = px % size, y = (px / size) | 0;
+                let w = 1;
+                if (step === 1) { for (let yy = y - 1; yy >= 0 && w < 13 && isRoad[yy * size + x]; yy--) w++; for (let yy = y + 1; yy < size && w < 13 && isRoad[yy * size + x]; yy++) w++; }
+                else            { for (let xx = x - 1; xx >= 0 && w < 13 && isRoad[y * size + xx]; xx--) w++; for (let xx = x + 1; xx < size && w < 13 && isRoad[y * size + xx]; xx++) w++; }
+                return w;
+              };
+              const runsAlong = across(at(k - 1)) <= before && across(at(e)) <= along;   // not a road crossing the line
+              const ha = hAt(at(k - 1)), hb = hAt(at(e)), line = j => ha + (hb - ha) * (j - k + 1) / (gap + 1);
+              let top = 0, level = true, wet = false;
+              for (let j = k; j < e; j++) {
+                const px = at(j), i = px * 4, hj = hp[i], rgb = (tp[i] << 16) | (tp[i + 1] << 8) | tp[i + 2];
+                top = Math.max(top, hj);
+                if (Math.abs(hj - line(j)) > TRACK_LEVEL) level = false;
+                if (riverbed.has(rgb) || (natural.has(rgb) && hj < seaLevel)) wet = true;   // never a road across water
+              }
+              const covered = gap <= TUNNEL_GAP && Math.abs(ha - hb) <= 2 && top >= Math.max(ha, hb) + 2;   // tunnel or overpass
+              const graded  = level && Math.abs(ha - hb) <= gap / 4 + 1;                                   // a levelled track
+              if (!wet && runsAlong && before >= TUNNEL_RUN && along >= TUNNEL_RUN && (covered || graded)) {
+                const eff = Math.min(isRoad[at(k - 1)], isRoad[at(e)]);
+                for (let j = k; j < e; j++) { tunnelEff[at(j)] = eff; tunnelH[at(j)] = line(j); isRoad[at(j)] = eff; }
+                changed = true;
+              }
+            }
+            k = e;
           }
-          k = e;
         }
       }
+      if (!changed) break;
     }
     for (let px = 0; px < size * size; px++) if (tunnelEff[px]) { nat[px] = 0; pxStep[px] = 0; }
     const hs = new Float32Array(CELL * CELL);
     for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-      let roadEff = 0, surf = 0, land = 0, waterPx = 0, deck = 0, constructed = 0, forest = 0, step = 0, maxStep = 0, k = 0;
+      let roadEff = 0, surf = 0, land = 0, waterPx = 0, seaPx = 0, deck = 0, constructed = 0, forest = 0, step = 0, maxStep = 0, k = 0;
       for (let y = 0; y < CELL; y++) for (let x = 0; x < CELL; x++) {
         const px = (r * CELL + y) * size + (c * CELL + x), i = px * 4;
         if (pxStep[px] > maxStep) maxStep = pxStep[px];
@@ -325,7 +368,7 @@
         if (y > 0) step += Math.abs(ht - (tunnelEff[px - size] ? tunnelH[px - size] : hp[i - size * 4]));
         const rEff = tunnel ? tunnelEff[px] : road.get(rgb), nEff = tunnel ? undefined : natural.get(rgb);
         const isWater = !tunnel && (riverbed.has(rgb) || (nEff !== undefined && ht < seaLevel));
-        if (isWater) { waterPx++; continue; }
+        if (isWater) { waterPx++; if (!riverbed.has(rgb)) seaPx++; continue; }
         land++;
         if (rEff !== undefined) { roadEff = Math.max(roadEff, rEff); surf += rEff; deck++; }
         else if (nEff !== undefined) { surf += nEff; if (forestSet.has(rgb)) forest++; }
@@ -338,13 +381,32 @@
       g.surf[cell] = land ? surf / land : 1;
       g.forest[cell] = forest * 2 >= CELL * CELL ? 1 : 0;
       g.paved[cell] = constructed * 2 >= CELL * CELL ? 1 : 0;
-      g.water[cell] = waterPx * 2 >= CELL * CELL ? 1 : 0;
+      g.water[cell] = seaPx * 2 >= CELL * CELL ? 1 : 0;   // sea for now; cut down to the ocean below
       g.blocked[cell] = waterPx > 0 && deck === 0 ? 1 : 0;
       g.maxStep[cell] = maxStep;
       g.cliff[cell] = maxStep >= CLIFF_STEP && roadEff === 0 && !g.paved[cell] ? 1 : 0;
     }
     g.ramp = new Uint8Array(n);   // roads and constructed ground: where a climb can be made (ramps, built slopes)
     for (let c = 0; c < n; c++) g.ramp[c] = g.road[c] > 0 || g.paved[c] ? 1 : 0;
+    //The ocean: sea cells connected to the map's edge (8-neighbours). Rivers and inland lakes drop out.
+    {
+      const ocean = new Uint8Array(n), queue = new Int32Array(n);
+      let head = 0, tail = 0;
+      for (let c = 0; c < n; c++) {
+        const r = (c / N) | 0, col = c % N;
+        if (g.water[c] && (r === 0 || r === N - 1 || col === 0 || col === N - 1)) { ocean[c] = 1; queue[tail++] = c; }
+      }
+      while (head < tail) {
+        const u = queue[head++], ur = (u / N) | 0, uc = u % N;
+        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+          const vr = ur + dr, vc = uc + dc;
+          if (vr < 0 || vr >= N || vc < 0 || vc >= N) continue;
+          const v = vr * N + vc;
+          if (g.water[v] && !ocean[v]) { ocean[v] = 1; queue[tail++] = v; }
+        }
+      }
+      g.water = ocean;
+    }
     //Cells to the nearest road or constructed ground (breadth-first from all of them at once; the world wraps).
     const queue = new Int32Array(n);
     let head = 0, tail = 0;
